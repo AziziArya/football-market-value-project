@@ -1,0 +1,4 @@
+player_id,transfer_date,from_club_name,to_club_name,transfer_fee,is_loan
+418560,2022-07-01,Borussia Dortmund,Manchester City,60000000,False
+342229,2024-07-01,Paris Saint-Germain,Real Madrid,0,False
+581678,2023-06-01,Borussia Dortmund,Real Madrid,103000000,False
