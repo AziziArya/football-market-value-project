@@ -1,6 +1,6 @@
 # TEST STATUS
 
-**190 tests, 0 failures**, run via `python3 -m pytest tests/`.
+**527 tests, 0 failures**, run via `python3 -m pytest tests/`.
 Runtime: ~25-35 seconds for the full suite.
 
 This document explains what each category actually exercises — not
@@ -24,7 +24,10 @@ just that tests exist.
 | `test_matching/test_review_persistence.py` | 12 | DB-backed queue: persist/list/resolve/promote as 3 separate steps, dedup on rerun, resolve-twice rejected, promote-before-resolve rejected, real conflict refusal |
 | `test_matching/test_wikidata_matching.py` | 14 | Adapter correctness (`from_wikidata_record`, `build_identity_input_for_player`), and **explicit reuse verification**: no wikidata-specific thresholds/scoring exist anywhere in `matching/identity.py`, enrichment calls the literal same `DEFAULT_THRESHOLDS` object |
 | `test_matching/test_wikidata_enrichment.py` | 17 | Conflict protection (3 distinct conflict shapes), no-fabrication (zero/multiple candidates, DOB conflict, unrelated person), missing-field NULL handling, idempotent rerun, DB constraint-level protection (`ConstraintException` on attempted re-link/QID-sharing) |
-| `test_pipeline/test_run_ingestion.py` | 8 | Full real pipeline smoke test, missing-provider abort behavior, `--continue-on-error`, idempotent rerun (append-only tables double, upserted tables don't), **real 16,107-record performance regression guard (<30s ceiling)** |
+| `test_pipeline/test_run_ingestion.py` | 8 | Full real pipeline smoke test, missing-provider abort behavior, `--continue-on-error`, idempotent rerun (ALL tables unchanged since G9), **real 16,107-record performance regression guard (<30s ceiling)** |
+| `test_idempotency/test_g9_rerun_invariants.py` | 9 | G9: rerun adds no rows in any table (also with the fixture's date changed), logical-key uniqueness, changed value / changed match outcome are appended (append-only kept), `is_current` is not a selection criterion, legacy duplicates are not grown/deleted, no new migration |
+| `test_api/` | 276 | API (Steps 4.1-4.3): domain (enums vs contract, normalization == reference on all 16,107 names, registry, link rules, search incl. brute-force oracle), config, read-only repositories + RM1/RM2/RM3 (incl. legacy duplicates), fail-closed startup (8 corruption cases, no leaks), `/health`, `/data-freshness`, **`/players/search`**, **`/players/{player_id}`** (end-to-end differential test vs an independent oracle on the real data, pagination boundaries, filters, accents, duplicate names, aliases, no N+1 by query counting, honesty invariants, 19 validation cases, corrupted-DB cases), **`/players/{player_id}`** (id grammar incl. the removed `p:<uuid>` alias, 400/404, profile == search item + provenance + meta for 5 canonical + 120 random players, all 16,107 profiles through the service, provenance rules on altered data, query counts), generated-OpenAPI conformance, architecture fitness |
+| `test_contract/` | 52 | API contract (openapi.json), architecture-doc and search-spec checks. Documentation tests: no API exists |
 | `test_pipeline/test_wikidata_orchestration.py` | 11 | Enrichment runs only after matching+players exist (verified by inspecting DB state from inside a monkeypatched spy), non-blocking failure modes (missing fixture, fetch exception, mid-enrichment exception), core-failure-still-aborts-before-enrichment, enrichment errors appear in the saved JSON report |
 | `test_reporting/test_coverage_report.py` | 9 | Synthetic completeness/lineage math, injury-gap detection (seeded a real gap, confirmed it's flagged), value-field separation in the report itself, **real-data smoke test** against an actual pipeline run |
 

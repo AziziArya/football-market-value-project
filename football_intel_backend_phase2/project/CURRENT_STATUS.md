@@ -19,7 +19,7 @@ frontend, UI. See `NEXT_PHASE.md`.
 
 ## Test count
 
-**190 tests, all passing**, across 17 test files. See `TEST_STATUS.md`
+**527 tests, all passing**, across 17+ test files. See `TEST_STATUS.md`
 for the full breakdown and what each category actually exercises.
 
 ## Real-data validation status

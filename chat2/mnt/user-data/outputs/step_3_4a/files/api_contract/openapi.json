@@ -1,0 +1,2519 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Football Player Intelligence API - contract",
+    "version": "0.2.0-draft",
+    "description": "CONTRACT ONLY - nothing here is implemented. Step 3.1 (identity/provenance) + Step 3.2 (paths). Every leaf property has x-source (real table/column) or x-derived (rule). x-status: IMPLEMENTABLE_TODAY = producible from the current DB; SCHEMA_ONLY = table exists but is empty; PLANNED = not produced yet, always nullable/availability-tagged. Examples were generated from a local sandbox run of the real pipeline (16,107 EA players + the two sample fixtures); timestamps belong to that run."
+  },
+  "paths": {
+    "/health": {
+      "get": {
+        "operationId": "getHealth",
+        "summary": "Liveness + database reachability (no internals exposed)",
+        "x-status": "IMPLEMENTABLE_TODAY",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                },
+                "examples": {
+                  "health_ok": {
+                    "$ref": "#/components/examples/health_ok"
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        }
+      }
+    },
+    "/data-freshness": {
+      "get": {
+        "operationId": "getDataFreshness",
+        "summary": "Per-source origin, dataset version and ingestion time",
+        "x-status": "IMPLEMENTABLE_TODAY",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataFreshnessResponse"
+                },
+                "examples": {
+                  "data_freshness_today": {
+                    "$ref": "#/components/examples/data_freshness_today"
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        },
+        "description": "Honest status of every data domain, including the ones that do not exist yet (injury source, model). is_live is always false today."
+      }
+    },
+    "/players/search": {
+      "get": {
+        "operationId": "searchPlayers",
+        "summary": "Search all 16,107 EA players (+ canonical aliases)",
+        "x-status": "IMPLEMENTABLE_TODAY",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Q"
+          },
+          {
+            "$ref": "#/components/parameters/EntityKindQ"
+          },
+          {
+            "$ref": "#/components/parameters/PositionQ"
+          },
+          {
+            "$ref": "#/components/parameters/NationalityQ"
+          },
+          {
+            "$ref": "#/components/parameters/ClubQ"
+          },
+          {
+            "$ref": "#/components/parameters/MinOverallQ"
+          },
+          {
+            "$ref": "#/components/parameters/SortQ"
+          },
+          {
+            "$ref": "#/components/parameters/LimitQ"
+          },
+          {
+            "$ref": "#/components/parameters/OffsetQ"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SearchResponse"
+                },
+                "examples": {
+                  "search_vinicius": {
+                    "$ref": "#/components/examples/search_vinicius"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        },
+        "description": "Filters are AND-combined. Names are NOT identifiers (124 EA display names occur more than once), so every item carries club/nationality/position/date_of_birth and a stable id. Each item carries quick EA value, source-market-value availability, injury status and image if any. Model estimate is included as the PLANNED block (NOT_YET_INTEGRATED today)."
+      }
+    },
+    "/players/{player_id}": {
+      "get": {
+        "operationId": "getPlayer",
+        "summary": "Player intelligence profile",
+        "x-status": "IMPLEMENTABLE_TODAY",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/PlayerIdPath"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PlayerProfile"
+                },
+                "examples": {
+                  "profile_canonical_haaland": {
+                    "$ref": "#/components/examples/profile_canonical_haaland"
+                  },
+                  "profile_ea_only_salah": {
+                    "$ref": "#/components/examples/profile_ea_only_salah"
+                  },
+                  "profile_ea_only_ambiguous": {
+                    "$ref": "#/components/examples/profile_ea_only_ambiguous"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        }
+      }
+    },
+    "/players/{player_id}/market-value": {
+      "get": {
+        "operationId": "getPlayerMarketValue",
+        "summary": "Real-world market value history (source data, never the model)",
+        "x-status": "IMPLEMENTABLE_TODAY",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/PlayerIdPath"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MarketValueResponse"
+                },
+                "examples": {
+                  "market_value_haaland": {
+                    "$ref": "#/components/examples/market_value_haaland"
+                  },
+                  "market_value_ea_only": {
+                    "$ref": "#/components/examples/market_value_ea_only"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        }
+      }
+    },
+    "/players/{player_id}/ea-attributes": {
+      "get": {
+        "operationId": "getPlayerEaAttributes",
+        "summary": "EA FC26 attributes that exist in the database",
+        "x-status": "IMPLEMENTABLE_TODAY",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/PlayerIdPath"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EaAttributesResponse"
+                },
+                "examples": {
+                  "ea_attributes_salah": {
+                    "$ref": "#/components/examples/ea_attributes_salah"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        },
+        "description": "overall, potential, preferred foot and EA in-game value only. Detailed attributes are PLANNED (see EaDetailedAttributes)."
+      }
+    },
+    "/players/{player_id}/injuries": {
+      "get": {
+        "operationId": "getPlayerInjuries",
+        "summary": "Injury status (three-state) and records",
+        "x-status": "SCHEMA_ONLY",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/PlayerIdPath"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InjuriesResponse"
+                },
+                "examples": {
+                  "injuries_ea_only": {
+                    "$ref": "#/components/examples/injuries_ea_only"
+                  },
+                  "injuries_canonical": {
+                    "$ref": "#/components/examples/injuries_canonical"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        }
+      }
+    },
+    "/players/{player_id}/lineage": {
+      "get": {
+        "operationId": "getPlayerLineage",
+        "summary": "Per-field, per-source values and link states",
+        "x-status": "IMPLEMENTABLE_TODAY",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/PlayerIdPath"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LineageResponse"
+                },
+                "examples": {
+                  "lineage_vini": {
+                    "$ref": "#/components/examples/lineage_vini"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "EntityKind": {
+        "type": "string",
+        "enum": [
+          "CANONICAL",
+          "EA_ONLY"
+        ],
+        "description": "CANONICAL = a row exists in players (matching produced MATCHED/PROBABLE_MATCH). EA_ONLY = player exists only as an EA FC26 record; NO canonical identity is created or inferred."
+      },
+      "MatchStatus": {
+        "type": "string",
+        "enum": [
+          "MATCHED",
+          "PROBABLE_MATCH",
+          "AMBIGUOUS",
+          "UNMATCHED",
+          "NOT_EVALUATED"
+        ],
+        "description": "First four equal identity_matches.match_status CHECK values. NOT_EVALUATED is API-only: matching was never run for this player against this source (e.g. Wikidata enrichment only iterates canonical players)."
+      },
+      "DataOrigin": {
+        "type": "string",
+        "enum": [
+          "REAL_FULL",
+          "SAMPLE_FIXTURE",
+          "UNKNOWN"
+        ],
+        "x-derived": "server-side source registry keyed by source name (NOT parsed from dataset_version: wikidata fixture rows are currently stamped 'live:<date>', see KNOWN GAP G2)."
+      },
+      "Availability": {
+        "type": "string",
+        "enum": [
+          "AVAILABLE",
+          "NOT_MATCHED",
+          "NO_SOURCE_DATA",
+          "NOT_YET_INTEGRATED"
+        ],
+        "description": "Why a value block is empty. NOT_MATCHED = player has no link to the source. NO_SOURCE_DATA = linked, but source has no value. NOT_YET_INTEGRATED = capability does not exist yet (ML model). Never collapse into null/0. EA detailed attributes use NOT_YET_INTEGRATED too (not stored in the DB yet)."
+      },
+      "InjuryStatus": {
+        "type": "string",
+        "enum": [
+          "NO_SOURCE_AVAILABLE",
+          "CONFIRMED_NO_INJURIES",
+          "HAS_RECORDS",
+          "NOT_EVALUATED"
+        ],
+        "description": "First three equal injury_data_status.status CHECK values. NOT_EVALUATED is API-only: injury_data_status rows exist only for canonical players, so EA_ONLY players have no row."
+      },
+      "PlayerId": {
+        "type": "string",
+        "pattern": "^(ea:[0-9]{1,9}|p:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$",
+        "description": "PUBLIC, STABLE handle: 'ea:<ea_fc26_id>' (works for all 16,107 EA players; never changes when a player later becomes canonical). 'p:<player_uid>' is an INTERNAL alias: accepted on input for canonical players, never returned as `id`."
+      },
+      "SourceProvenance": {
+        "type": "object",
+        "required": [
+          "source",
+          "dataset_version",
+          "data_origin"
+        ],
+        "properties": {
+          "source": {
+            "type": "string",
+            "x-source": {
+              "table": "player_field_values",
+              "column": "source"
+            }
+          },
+          "dataset_version": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "x-source": {
+              "table": "player_field_values",
+              "column": "dataset_version"
+            }
+          },
+          "fetched_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "x-source": {
+              "table": "player_field_values",
+              "column": "fetched_at"
+            }
+          },
+          "data_origin": {
+            "$ref": "#/components/schemas/DataOrigin"
+          }
+        }
+      },
+      "LinkState": {
+        "type": "object",
+        "description": "State of the link between this player and ONE external source. `confidence`/`matched_on` are present ONLY for MATCHED/PROBABLE_MATCH. For AMBIGUOUS/UNMATCHED/NOT_EVALUATED they are null and candidate ids/names are never exposed (an AMBIGUOUS candidate may already belong to another canonical player).",
+        "required": [
+          "status",
+          "reference_data_origin"
+        ],
+        "properties": {
+          "status": {
+            "$ref": "#/components/schemas/MatchStatus"
+          },
+          "confidence": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "x-source": {
+              "table": "identity_matches",
+              "column": "match_confidence"
+            }
+          },
+          "matched_on": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "x-source": {
+              "table": "identity_matches",
+              "column": "matched_on"
+            }
+          },
+          "reference_data_origin": {
+            "$ref": "#/components/schemas/DataOrigin",
+            "description": "What the player was compared AGAINST. UNMATCHED against a SAMPLE_FIXTURE (5 players) means 'not in the sample', not 'not in the real world'."
+          },
+          "review_pending": {
+            "type": "boolean",
+            "x-source": {
+              "table": "review_queue",
+              "column": "status"
+            }
+          }
+        }
+      },
+      "SourceIds": {
+        "type": "object",
+        "required": [
+          "ea_fc26_id"
+        ],
+        "properties": {
+          "ea_fc26_id": {
+            "type": "integer",
+            "x-source": {
+              "table": "ea_fc26_attributes",
+              "column": "ea_fc26_id"
+            }
+          },
+          "transfermarkt_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-source": {
+              "table": "v_players",
+              "column": "transfermarkt_id"
+            },
+            "description": "null unless status MATCHED/PROBABLE_MATCH"
+          },
+          "wikidata_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "x-source": {
+              "table": "v_players",
+              "column": "wikidata_id"
+            },
+            "description": "null unless linked. Read v_players, never players (DATABASE_SCHEMA.md warning)."
+          }
+        }
+      },
+      "Identity": {
+        "type": "object",
+        "required": [
+          "entity_kind",
+          "source_ids",
+          "links"
+        ],
+        "properties": {
+          "entity_kind": {
+            "$ref": "#/components/schemas/EntityKind"
+          },
+          "canonical_player_uid": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "x-source": {
+              "table": "v_players",
+              "column": "player_uid"
+            }
+          },
+          "source_ids": {
+            "$ref": "#/components/schemas/SourceIds"
+          },
+          "links": {
+            "type": "object",
+            "required": [
+              "transfermarkt",
+              "wikidata"
+            ],
+            "properties": {
+              "transfermarkt": {
+                "$ref": "#/components/schemas/LinkState"
+              },
+              "wikidata": {
+                "$ref": "#/components/schemas/LinkState"
+              }
+            }
+          }
+        }
+      },
+      "EaIngameValue": {
+        "type": "object",
+        "description": "EA FC26 in-game value. NOT a real-world market value.",
+        "required": [
+          "availability"
+        ],
+        "properties": {
+          "availability": {
+            "$ref": "#/components/schemas/Availability"
+          },
+          "amount_eur": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-source": {
+              "table": "ea_fc26_attributes",
+              "column": "value_eur_ingame"
+            }
+          },
+          "provenance": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SourceProvenance"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "SourceMarketValue": {
+        "type": "object",
+        "description": "Real-world market value from the market-value source (Transfermarkt dataset). Today: SAMPLE_FIXTURE, 5 players, illustrative amounts.",
+        "required": [
+          "availability"
+        ],
+        "properties": {
+          "availability": {
+            "$ref": "#/components/schemas/Availability"
+          },
+          "amount_eur": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-source": {
+              "table": "market_value_history",
+              "column": "value_eur"
+            }
+          },
+          "valuation_date": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date",
+            "x-source": {
+              "table": "market_value_history",
+              "column": "valuation_date"
+            }
+          },
+          "provenance": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SourceProvenance"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "ModelEstimate": {
+        "type": "object",
+        "description": "ML estimate. Its TARGET is EA in-game value (notebook target log1p(value_eur) from EA/SoFIFA), so it must never be labelled or compared as a market-value prediction without that caveat. PLANNED: the backend does not produce it yet; today availability is always NOT_YET_INTEGRATED and amount_eur/model_version are null.",
+        "required": [
+          "availability",
+          "target"
+        ],
+        "properties": {
+          "availability": {
+            "$ref": "#/components/schemas/Availability"
+          },
+          "target": {
+            "type": "string",
+            "enum": [
+              "EA_INGAME_VALUE"
+            ],
+            "x-derived": "constant; derived from feature_list.json target"
+          },
+          "amount_eur": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-source": {
+              "table": "ea_fc26_attributes",
+              "column": "predicted_value_eur"
+            },
+            "x-status": "PLANNED"
+          },
+          "model_version": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "x-source": {
+              "table": "ea_fc26_attributes",
+              "column": "model_version"
+            },
+            "x-status": "PLANNED"
+          }
+        },
+        "x-status": "PLANNED"
+      },
+      "Values": {
+        "type": "object",
+        "description": "Three separate blocks, never merged, never a generic 'value' field.",
+        "required": [
+          "ea_ingame_value",
+          "source_market_value",
+          "model_estimate"
+        ],
+        "properties": {
+          "ea_ingame_value": {
+            "$ref": "#/components/schemas/EaIngameValue"
+          },
+          "source_market_value": {
+            "$ref": "#/components/schemas/SourceMarketValue"
+          },
+          "model_estimate": {
+            "$ref": "#/components/schemas/ModelEstimate"
+          }
+        }
+      },
+      "InjuryBlock": {
+        "type": "object",
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "status": {
+            "$ref": "#/components/schemas/InjuryStatus"
+          },
+          "checked_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "x-source": {
+              "table": "injury_data_status",
+              "column": "checked_at"
+            }
+          }
+        }
+      },
+      "PlayerImage": {
+        "type": "object",
+        "description": "Only Wikidata/Commons images are allowed (owner decision). SoFIFA player_face_url is explicitly out of scope.",
+        "required": [
+          "url",
+          "source"
+        ],
+        "properties": {
+          "url": {
+            "type": "string",
+            "x-source": {
+              "table": "player_images",
+              "column": "image_url"
+            }
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "wikidata"
+            ],
+            "x-source": {
+              "table": "player_images",
+              "column": "source"
+            }
+          },
+          "license": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "x-source": {
+              "table": "player_images",
+              "column": "license"
+            }
+          },
+          "attribution": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "x-source": {
+              "table": "player_images",
+              "column": "attribution"
+            }
+          }
+        }
+      },
+      "PlayerCore": {
+        "type": "object",
+        "description": "Identity-display fields, each read from player_field_values with source = ea_fc26 (works for EA_ONLY, where player_uid IS NULL and source_record_id = ea_fc26_id).",
+        "required": [
+          "id",
+          "display_name",
+          "identity"
+        ],
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/PlayerId"
+          },
+          "display_name": {
+            "type": "string",
+            "x-source": {
+              "table": "player_field_values",
+              "field_name": "display_name",
+              "source": "ea_fc26"
+            }
+          },
+          "position": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "x-source": {
+              "table": "player_field_values",
+              "field_name": "position",
+              "source": "ea_fc26"
+            }
+          },
+          "club": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "x-source": {
+              "table": "player_field_values",
+              "field_name": "club",
+              "source": "ea_fc26"
+            }
+          },
+          "nationality": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "x-source": {
+              "table": "player_field_values",
+              "field_name": "nationality",
+              "source": "ea_fc26"
+            }
+          },
+          "date_of_birth": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date",
+            "x-source": {
+              "table": "player_field_values",
+              "field_name": "date_of_birth",
+              "source": "ea_fc26"
+            }
+          },
+          "overall_rating": {
+            "type": "integer",
+            "x-source": {
+              "table": "ea_fc26_attributes",
+              "column": "overall_rating"
+            }
+          },
+          "potential": {
+            "type": "integer",
+            "x-source": {
+              "table": "ea_fc26_attributes",
+              "column": "potential"
+            }
+          },
+          "identity": {
+            "$ref": "#/components/schemas/Identity"
+          },
+          "preferred_foot": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "x-source": {
+              "table": "player_field_values",
+              "field_name": "preferred_foot",
+              "source": "ea_fc26"
+            }
+          }
+        }
+      },
+      "PlayerSummary": {
+        "description": "Search/autocomplete item. Carries enough to disambiguate (124 EA display names are duplicated) and to label data honestly.",
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/PlayerCore"
+          },
+          {
+            "type": "object",
+            "required": [
+              "values",
+              "injury"
+            ],
+            "properties": {
+              "image": {
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/PlayerImage"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "values": {
+                "$ref": "#/components/schemas/Values"
+              },
+              "injury": {
+                "$ref": "#/components/schemas/InjuryBlock"
+              }
+            }
+          }
+        ]
+      },
+      "ResponseMeta": {
+        "type": "object",
+        "required": [
+          "contract_version",
+          "generated_at",
+          "contains_sample_data"
+        ],
+        "properties": {
+          "contract_version": {
+            "type": "string",
+            "x-derived": "constant = info.version"
+          },
+          "generated_at": {
+            "type": "string",
+            "format": "date-time",
+            "x-derived": "response time (NOT data freshness; see provenance)"
+          },
+          "contains_sample_data": {
+            "type": "boolean",
+            "x-derived": "true if any block in this response has data_origin = SAMPLE_FIXTURE (source registry)"
+          }
+        }
+      },
+      "ProblemError": {
+        "type": "object",
+        "required": [
+          "parameter",
+          "reason"
+        ],
+        "properties": {
+          "parameter": {
+            "type": "string",
+            "x-derived": "request parameter name"
+          },
+          "reason": {
+            "type": "string",
+            "x-derived": "validation message"
+          }
+        }
+      },
+      "ProblemCode": {
+        "type": "string",
+        "enum": [
+          "INVALID_PARAMETER",
+          "INVALID_PLAYER_ID",
+          "PLAYER_NOT_FOUND",
+          "DATA_UNAVAILABLE",
+          "INTERNAL_ERROR"
+        ]
+      },
+      "Problem": {
+        "type": "object",
+        "description": "RFC 9457 problem details (application/problem+json). 404 is ONLY for an unknown player; a known player with no data is 200 with an Availability, never 404.",
+        "required": [
+          "type",
+          "title",
+          "status",
+          "code"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "x-derived": "'about:blank' or a documentation URI"
+          },
+          "title": {
+            "type": "string",
+            "x-derived": "short fixed summary per code"
+          },
+          "status": {
+            "type": "integer",
+            "x-derived": "HTTP status"
+          },
+          "code": {
+            "$ref": "#/components/schemas/ProblemCode"
+          },
+          "detail": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "x-derived": "human-readable, never a stack trace/SQL/path"
+          },
+          "instance": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "x-derived": "request path"
+          },
+          "errors": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ProblemError"
+            }
+          }
+        }
+      },
+      "SearchMatchQuality": {
+        "type": "string",
+        "enum": [
+          "EXACT",
+          "PREFIX",
+          "TOKEN_PREFIX",
+          "SUBSTRING"
+        ]
+      },
+      "SearchMatch": {
+        "type": "object",
+        "required": [
+          "quality"
+        ],
+        "properties": {
+          "quality": {
+            "$ref": "#/components/schemas/SearchMatchQuality"
+          },
+          "matched_alias": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "x-source": {
+              "table": "player_field_values",
+              "column": "field_value"
+            },
+            "description": "Set when the query matched a display_name from another source (canonical players only), not the EA name."
+          },
+          "matched_alias_source": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "x-source": {
+              "table": "player_field_values",
+              "column": "source"
+            }
+          }
+        }
+      },
+      "SearchItem": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/PlayerSummary"
+          },
+          {
+            "type": "object",
+            "required": [
+              "match"
+            ],
+            "properties": {
+              "match": {
+                "$ref": "#/components/schemas/SearchMatch"
+              }
+            }
+          }
+        ]
+      },
+      "SearchResponse": {
+        "type": "object",
+        "required": [
+          "items",
+          "total",
+          "limit",
+          "offset",
+          "next_offset",
+          "query_normalized",
+          "meta"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SearchItem"
+            }
+          },
+          "total": {
+            "type": "integer",
+            "x-derived": "exact count of matching players (all pages)"
+          },
+          "limit": {
+            "type": "integer",
+            "x-derived": "echo"
+          },
+          "offset": {
+            "type": "integer",
+            "x-derived": "echo"
+          },
+          "next_offset": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-derived": "offset+limit, or null on the last page"
+          },
+          "query_normalized": {
+            "type": "string",
+            "x-derived": "q after accent-strip/casefold/whitespace-collapse"
+          },
+          "meta": {
+            "$ref": "#/components/schemas/ResponseMeta"
+          }
+        }
+      },
+      "PlayerProfile": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/PlayerSummary"
+          },
+          {
+            "type": "object",
+            "required": [
+              "provenance",
+              "meta"
+            ],
+            "properties": {
+              "provenance": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/SourceProvenance"
+                },
+                "description": "One entry per source that contributed ANY block of this response."
+              },
+              "meta": {
+                "$ref": "#/components/schemas/ResponseMeta"
+              }
+            }
+          }
+        ]
+      },
+      "MarketValuePoint": {
+        "type": "object",
+        "required": [
+          "amount_eur",
+          "valuation_date",
+          "dataset_version",
+          "data_origin"
+        ],
+        "properties": {
+          "amount_eur": {
+            "type": "integer",
+            "x-source": {
+              "table": "market_value_history",
+              "column": "value_eur"
+            }
+          },
+          "valuation_date": {
+            "type": "string",
+            "format": "date",
+            "x-source": {
+              "table": "market_value_history",
+              "column": "valuation_date"
+            }
+          },
+          "source": {
+            "type": "string",
+            "x-source": {
+              "table": "market_value_history",
+              "column": "source"
+            }
+          },
+          "dataset_version": {
+            "type": "string",
+            "x-source": {
+              "table": "market_value_history",
+              "column": "dataset_version"
+            }
+          },
+          "data_origin": {
+            "$ref": "#/components/schemas/DataOrigin"
+          }
+        }
+      },
+      "MarketValueResponse": {
+        "type": "object",
+        "required": [
+          "player_id",
+          "availability",
+          "points",
+          "latest",
+          "meta"
+        ],
+        "description": "Real-world market value history (market_value_history). Points are sorted by valuation_date ASC, then dataset_version ASC (the table is append-only across dataset versions, so the same date can appear twice). `latest` = highest valuation_date, ties -> newest dataset_version. No derived trend/difference fields: none is produced by the backend.",
+        "properties": {
+          "player_id": {
+            "$ref": "#/components/schemas/PlayerId"
+          },
+          "availability": {
+            "$ref": "#/components/schemas/Availability"
+          },
+          "points": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MarketValuePoint"
+            }
+          },
+          "latest": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/MarketValuePoint"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "meta": {
+            "$ref": "#/components/schemas/ResponseMeta"
+          }
+        }
+      },
+      "EaDetailedAttributes": {
+        "type": "object",
+        "x-status": "PLANNED",
+        "required": [
+          "availability",
+          "attributes"
+        ],
+        "description": "PLANNED. Detailed EA attributes (pace, finishing, dribbling, ...) are NOT stored in the database (ea_fc26_attributes.raw_json is NULL for every row). Today: availability = NOT_YET_INTEGRATED and attributes = null. Tracked as the separate 'Backend Data Integrity - EA detailed attributes' step.",
+        "properties": {
+          "availability": {
+            "$ref": "#/components/schemas/Availability"
+          },
+          "attributes": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "x-status": "PLANNED",
+            "x-derived": "null until the data-integrity step stores these values"
+          }
+        }
+      },
+      "EaAttributesResponse": {
+        "type": "object",
+        "required": [
+          "player_id",
+          "overall_rating",
+          "potential",
+          "ea_ingame_value",
+          "detailed_attributes",
+          "provenance",
+          "meta"
+        ],
+        "properties": {
+          "player_id": {
+            "$ref": "#/components/schemas/PlayerId"
+          },
+          "overall_rating": {
+            "type": "integer",
+            "x-source": {
+              "table": "ea_fc26_attributes",
+              "column": "overall_rating"
+            }
+          },
+          "potential": {
+            "type": "integer",
+            "x-source": {
+              "table": "ea_fc26_attributes",
+              "column": "potential"
+            }
+          },
+          "preferred_foot": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "x-source": {
+              "table": "player_field_values",
+              "field_name": "preferred_foot",
+              "source": "ea_fc26"
+            }
+          },
+          "ea_ingame_value": {
+            "$ref": "#/components/schemas/EaIngameValue"
+          },
+          "detailed_attributes": {
+            "$ref": "#/components/schemas/EaDetailedAttributes"
+          },
+          "provenance": {
+            "$ref": "#/components/schemas/SourceProvenance"
+          },
+          "meta": {
+            "$ref": "#/components/schemas/ResponseMeta"
+          }
+        }
+      },
+      "InjuryRecord": {
+        "type": "object",
+        "x-status": "SCHEMA_ONLY",
+        "description": "SCHEMA_ONLY: injury_records table exists but has no writer and no rows. Shape is fixed now; `records` is always [] today.",
+        "properties": {
+          "injury_type": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "x-source": {
+              "table": "injury_records",
+              "column": "injury_type"
+            }
+          },
+          "start_date": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date",
+            "x-source": {
+              "table": "injury_records",
+              "column": "start_date"
+            }
+          },
+          "expected_return": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date",
+            "x-source": {
+              "table": "injury_records",
+              "column": "expected_return"
+            }
+          },
+          "actual_return": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date",
+            "x-source": {
+              "table": "injury_records",
+              "column": "actual_return"
+            }
+          },
+          "days_out": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-source": {
+              "table": "injury_records",
+              "column": "days_out"
+            }
+          },
+          "source": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "x-source": {
+              "table": "injury_records",
+              "column": "source"
+            }
+          }
+        }
+      },
+      "InjuriesResponse": {
+        "type": "object",
+        "required": [
+          "player_id",
+          "injury",
+          "records",
+          "meta"
+        ],
+        "description": "Three-state honesty: `injury.status` is always present. `records` is non-empty ONLY when status = HAS_RECORDS. No derived metrics (burden, frequency): not produced by the backend.",
+        "properties": {
+          "player_id": {
+            "$ref": "#/components/schemas/PlayerId"
+          },
+          "injury": {
+            "$ref": "#/components/schemas/InjuryBlock"
+          },
+          "records": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/InjuryRecord"
+            }
+          },
+          "meta": {
+            "$ref": "#/components/schemas/ResponseMeta"
+          }
+        }
+      },
+      "FieldValue": {
+        "type": "object",
+        "required": [
+          "field_value",
+          "source",
+          "data_origin"
+        ],
+        "properties": {
+          "field_value": {
+            "type": "string",
+            "x-source": {
+              "table": "player_field_values",
+              "column": "field_value"
+            }
+          },
+          "source": {
+            "type": "string",
+            "x-source": {
+              "table": "player_field_values",
+              "column": "source"
+            }
+          },
+          "dataset_version": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "x-source": {
+              "table": "player_field_values",
+              "column": "dataset_version"
+            }
+          },
+          "fetched_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "x-source": {
+              "table": "player_field_values",
+              "column": "fetched_at"
+            }
+          },
+          "is_current": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "x-source": {
+              "table": "player_field_values",
+              "column": "is_current"
+            }
+          },
+          "data_origin": {
+            "$ref": "#/components/schemas/DataOrigin"
+          }
+        }
+      },
+      "LineageField": {
+        "type": "object",
+        "required": [
+          "field_name",
+          "values"
+        ],
+        "properties": {
+          "field_name": {
+            "type": "string",
+            "x-source": {
+              "table": "player_field_values",
+              "column": "field_name"
+            }
+          },
+          "values": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FieldValue"
+            },
+            "description": "One entry per source; disagreeing sources are BOTH listed, never merged."
+          }
+        }
+      },
+      "LineageResponse": {
+        "type": "object",
+        "required": [
+          "player_id",
+          "identity",
+          "fields",
+          "meta"
+        ],
+        "properties": {
+          "player_id": {
+            "$ref": "#/components/schemas/PlayerId"
+          },
+          "identity": {
+            "$ref": "#/components/schemas/Identity"
+          },
+          "fields": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LineageField"
+            }
+          },
+          "meta": {
+            "$ref": "#/components/schemas/ResponseMeta"
+          }
+        }
+      },
+      "FreshnessRole": {
+        "type": "string",
+        "enum": [
+          "PLAYER_ATTRIBUTES",
+          "MARKET_VALUE",
+          "ENRICHMENT",
+          "INJURY",
+          "MODEL"
+        ]
+      },
+      "SourceFreshness": {
+        "type": "object",
+        "required": [
+          "role",
+          "availability",
+          "is_live"
+        ],
+        "properties": {
+          "role": {
+            "$ref": "#/components/schemas/FreshnessRole"
+          },
+          "source": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "x-source": {
+              "table": "player_field_values",
+              "column": "source"
+            }
+          },
+          "availability": {
+            "$ref": "#/components/schemas/Availability"
+          },
+          "data_origin": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/DataOrigin"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "dataset_version": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "x-source": {
+              "table": "player_field_values",
+              "column": "dataset_version"
+            }
+          },
+          "last_fetched_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "x-source": {
+              "table": "player_field_values",
+              "column": "fetched_at"
+            },
+            "description": "Latest load timestamp for that source (market value: market_value_history.imported_at). This is when WE first loaded the currently served data (a no-op rerun does not advance it), not when the source last changed."
+          },
+          "record_count": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "x-derived": "count of source records (players) loaded from that source"
+          },
+          "is_live": {
+            "type": "boolean",
+            "enum": [
+              false
+            ],
+            "x-derived": "constant false: no provider retrieves live data today (live: is reserved for a future real endpoint path)"
+          }
+        }
+      },
+      "DataFreshnessResponse": {
+        "type": "object",
+        "required": [
+          "sources",
+          "meta"
+        ],
+        "properties": {
+          "sources": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SourceFreshness"
+            }
+          },
+          "meta": {
+            "$ref": "#/components/schemas/ResponseMeta"
+          }
+        }
+      },
+      "HealthResponse": {
+        "type": "object",
+        "required": [
+          "status",
+          "database_reachable",
+          "contract_version"
+        ],
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "unavailable"
+            ],
+            "x-derived": "ok iff database reachable and migrations applied"
+          },
+          "database_reachable": {
+            "type": "boolean",
+            "x-derived": "a trivial read succeeded"
+          },
+          "contract_version": {
+            "type": "string",
+            "x-derived": "constant = info.version"
+          }
+        }
+      }
+    },
+    "parameters": {
+      "PlayerIdPath": {
+        "name": "player_id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "$ref": "#/components/schemas/PlayerId"
+        },
+        "description": "Use ea:<id>. p:<uid> is an internal alias."
+      },
+      "Q": {
+        "name": "q",
+        "in": "query",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 80
+        },
+        "description": "Trimmed, then normalised (Unicode NFKD accent-strip, casefold, whitespace collapsed). Matched against the EA display_name of every player and, for CANONICAL players only, display_name values from other sources (reported in match.matched_alias)."
+      },
+      "EntityKindQ": {
+        "name": "entity_kind",
+        "in": "query",
+        "schema": {
+          "$ref": "#/components/schemas/EntityKind"
+        }
+      },
+      "PositionQ": {
+        "name": "position",
+        "in": "query",
+        "schema": {
+          "type": "string",
+          "maxLength": 8
+        },
+        "description": "Exact EA position code (case-insensitive)."
+      },
+      "NationalityQ": {
+        "name": "nationality",
+        "in": "query",
+        "schema": {
+          "type": "string",
+          "maxLength": 60
+        },
+        "description": "Exact, case-insensitive, EA spelling (e.g. 'Holland')."
+      },
+      "ClubQ": {
+        "name": "club",
+        "in": "query",
+        "schema": {
+          "type": "string",
+          "maxLength": 80
+        },
+        "description": "Exact, case-insensitive, EA club name."
+      },
+      "MinOverallQ": {
+        "name": "min_overall",
+        "in": "query",
+        "schema": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 99
+        }
+      },
+      "SortQ": {
+        "name": "sort",
+        "in": "query",
+        "schema": {
+          "type": "string",
+          "enum": [
+            "relevance",
+            "overall_desc",
+            "name_asc"
+          ],
+          "default": "relevance"
+        },
+        "description": "relevance = match quality (EXACT<PREFIX<TOKEN_PREFIX<SUBSTRING), then overall_rating DESC, then ea_fc26_id ASC. All sorts end with ea_fc26_id ASC, so order is total and paging is stable."
+      },
+      "LimitQ": {
+        "name": "limit",
+        "in": "query",
+        "schema": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 50,
+          "default": 20
+        }
+      },
+      "OffsetQ": {
+        "name": "offset",
+        "in": "query",
+        "schema": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10000,
+          "default": 0
+        },
+        "description": "Offset paging. ASSUMPTION: data changes only when an ingestion run completes, so offsets are stable between runs."
+      }
+    },
+    "responses": {
+      "BadRequest": {
+        "description": "INVALID_PARAMETER or INVALID_PLAYER_ID.",
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/Problem"
+            }
+          }
+        }
+      },
+      "NotFound": {
+        "description": "PLAYER_NOT_FOUND - id is well-formed but no such EA player / canonical uid.",
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/Problem"
+            }
+          }
+        }
+      },
+      "Unavailable": {
+        "description": "DATA_UNAVAILABLE - database unreachable or migrations not applied.",
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/Problem"
+            }
+          }
+        }
+      },
+      "ServerError": {
+        "description": "INTERNAL_ERROR.",
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/Problem"
+            }
+          }
+        }
+      }
+    },
+    "examples": {
+      "profile_canonical_haaland": {
+        "summary": "CANONICAL player: Transfermarkt MATCHED (sample), Wikidata PROBABLE_MATCH (sample), Commons image",
+        "value": {
+          "id": "ea:239085",
+          "display_name": "Erling Haaland",
+          "position": "ST",
+          "club": "Manchester City",
+          "nationality": "Norway",
+          "date_of_birth": "2000-07-21",
+          "preferred_foot": "Left",
+          "overall_rating": 90,
+          "potential": 92,
+          "identity": {
+            "entity_kind": "CANONICAL",
+            "canonical_player_uid": "1b9f4774-32cc-4fca-b62d-61d2a33be78b",
+            "source_ids": {
+              "ea_fc26_id": 239085,
+              "transfermarkt_id": 418560,
+              "wikidata_id": "Q28967995"
+            },
+            "links": {
+              "transfermarkt": {
+                "status": "MATCHED",
+                "confidence": 1.0,
+                "matched_on": [
+                  "name",
+                  "dob",
+                  "nationality",
+                  "club"
+                ],
+                "reference_data_origin": "SAMPLE_FIXTURE",
+                "review_pending": false
+              },
+              "wikidata": {
+                "status": "PROBABLE_MATCH",
+                "confidence": 0.85,
+                "matched_on": [
+                  "name",
+                  "dob",
+                  "nationality"
+                ],
+                "reference_data_origin": "SAMPLE_FIXTURE",
+                "review_pending": false
+              }
+            }
+          },
+          "image": {
+            "url": "https://commons.wikimedia.org/wiki/Special:FilePath/Erling_Haaland_Morocco_v_Norway_7_June_2026-51.jpg",
+            "source": "wikidata",
+            "license": null,
+            "attribution": "Bryan Berlin"
+          },
+          "values": {
+            "ea_ingame_value": {
+              "availability": "AVAILABLE",
+              "amount_eur": 157000000,
+              "provenance": {
+                "source": "ea_fc26",
+                "dataset_version": "2025-09-19",
+                "fetched_at": "2026-09-30T20:30:44Z",
+                "data_origin": "REAL_FULL"
+              }
+            },
+            "source_market_value": {
+              "availability": "AVAILABLE",
+              "amount_eur": 200000000,
+              "valuation_date": "2025-06-01",
+              "provenance": {
+                "source": "transfermarkt_dataset",
+                "dataset_version": "sample_2026-07-06",
+                "fetched_at": "2026-09-30T20:30:46Z",
+                "data_origin": "SAMPLE_FIXTURE"
+              }
+            },
+            "model_estimate": {
+              "availability": "NOT_YET_INTEGRATED",
+              "target": "EA_INGAME_VALUE",
+              "amount_eur": null,
+              "model_version": null
+            }
+          },
+          "injury": {
+            "status": "NO_SOURCE_AVAILABLE",
+            "checked_at": "2026-09-30T20:30:47Z"
+          },
+          "provenance": [
+            {
+              "source": "ea_fc26",
+              "dataset_version": "2025-09-19",
+              "fetched_at": "2026-09-30T20:30:44Z",
+              "data_origin": "REAL_FULL"
+            },
+            {
+              "source": "transfermarkt_dataset",
+              "dataset_version": "sample_2026-07-06",
+              "fetched_at": "2026-09-30T20:30:46Z",
+              "data_origin": "SAMPLE_FIXTURE"
+            },
+            {
+              "source": "wikidata",
+              "dataset_version": "fixture:922e74f46d64",
+              "fetched_at": "2026-09-30T20:30:47Z",
+              "data_origin": "SAMPLE_FIXTURE"
+            }
+          ],
+          "meta": {
+            "contract_version": "0.2.0-draft",
+            "generated_at": "2026-09-30T20:30:00Z",
+            "contains_sample_data": true
+          }
+        }
+      },
+      "profile_ea_only_salah": {
+        "summary": "EA_ONLY player: nothing inferred - market value NOT_MATCHED, injury NOT_EVALUATED, no image",
+        "value": {
+          "id": "ea:209331",
+          "display_name": "Mohamed Salah",
+          "position": "RM",
+          "club": "Liverpool",
+          "nationality": "Egypt",
+          "date_of_birth": "1992-06-15",
+          "preferred_foot": "Left",
+          "overall_rating": 91,
+          "potential": 91,
+          "identity": {
+            "entity_kind": "EA_ONLY",
+            "canonical_player_uid": null,
+            "source_ids": {
+              "ea_fc26_id": 209331,
+              "transfermarkt_id": null,
+              "wikidata_id": null
+            },
+            "links": {
+              "transfermarkt": {
+                "status": "UNMATCHED",
+                "confidence": null,
+                "matched_on": null,
+                "reference_data_origin": "SAMPLE_FIXTURE",
+                "review_pending": false
+              },
+              "wikidata": {
+                "status": "NOT_EVALUATED",
+                "confidence": null,
+                "matched_on": null,
+                "reference_data_origin": "SAMPLE_FIXTURE",
+                "review_pending": false
+              }
+            }
+          },
+          "image": null,
+          "values": {
+            "ea_ingame_value": {
+              "availability": "AVAILABLE",
+              "amount_eur": 82000000,
+              "provenance": {
+                "source": "ea_fc26",
+                "dataset_version": "2025-09-19",
+                "fetched_at": "2026-09-30T20:30:44Z",
+                "data_origin": "REAL_FULL"
+              }
+            },
+            "source_market_value": {
+              "availability": "NOT_MATCHED",
+              "amount_eur": null,
+              "valuation_date": null,
+              "provenance": null
+            },
+            "model_estimate": {
+              "availability": "NOT_YET_INTEGRATED",
+              "target": "EA_INGAME_VALUE",
+              "amount_eur": null,
+              "model_version": null
+            }
+          },
+          "injury": {
+            "status": "NOT_EVALUATED",
+            "checked_at": null
+          },
+          "provenance": [
+            {
+              "source": "ea_fc26",
+              "dataset_version": "2025-09-19",
+              "fetched_at": "2026-09-30T20:30:44Z",
+              "data_origin": "REAL_FULL"
+            }
+          ],
+          "meta": {
+            "contract_version": "0.2.0-draft",
+            "generated_at": "2026-09-30T20:30:00Z",
+            "contains_sample_data": false
+          }
+        }
+      },
+      "profile_ea_only_ambiguous": {
+        "summary": "EA_ONLY with an AMBIGUOUS Transfermarkt review pending: status only, candidate ids never exposed",
+        "value": {
+          "id": "ea:233097",
+          "display_name": "Rick van Drongelen",
+          "position": "CB",
+          "club": "Samsunspor",
+          "nationality": "Holland",
+          "date_of_birth": "1998-12-20",
+          "preferred_foot": "Left",
+          "overall_rating": 74,
+          "potential": 79,
+          "identity": {
+            "entity_kind": "EA_ONLY",
+            "canonical_player_uid": null,
+            "source_ids": {
+              "ea_fc26_id": 233097,
+              "transfermarkt_id": null,
+              "wikidata_id": null
+            },
+            "links": {
+              "transfermarkt": {
+                "status": "AMBIGUOUS",
+                "confidence": null,
+                "matched_on": null,
+                "reference_data_origin": "SAMPLE_FIXTURE",
+                "review_pending": true
+              },
+              "wikidata": {
+                "status": "NOT_EVALUATED",
+                "confidence": null,
+                "matched_on": null,
+                "reference_data_origin": "SAMPLE_FIXTURE",
+                "review_pending": false
+              }
+            }
+          },
+          "image": null,
+          "values": {
+            "ea_ingame_value": {
+              "availability": "AVAILABLE",
+              "amount_eur": 7000000,
+              "provenance": {
+                "source": "ea_fc26",
+                "dataset_version": "2025-09-19",
+                "fetched_at": "2026-09-30T20:30:44Z",
+                "data_origin": "REAL_FULL"
+              }
+            },
+            "source_market_value": {
+              "availability": "NOT_MATCHED",
+              "amount_eur": null,
+              "valuation_date": null,
+              "provenance": null
+            },
+            "model_estimate": {
+              "availability": "NOT_YET_INTEGRATED",
+              "target": "EA_INGAME_VALUE",
+              "amount_eur": null,
+              "model_version": null
+            }
+          },
+          "injury": {
+            "status": "NOT_EVALUATED",
+            "checked_at": null
+          },
+          "provenance": [
+            {
+              "source": "ea_fc26",
+              "dataset_version": "2025-09-19",
+              "fetched_at": "2026-09-30T20:30:44Z",
+              "data_origin": "REAL_FULL"
+            }
+          ],
+          "meta": {
+            "contract_version": "0.2.0-draft",
+            "generated_at": "2026-09-30T20:30:00Z",
+            "contains_sample_data": false
+          }
+        }
+      },
+      "market_value_haaland": {
+        "summary": "Sample-fixture history (illustrative amounts), ascending by date",
+        "value": {
+          "player_id": "ea:239085",
+          "availability": "AVAILABLE",
+          "points": [
+            {
+              "amount_eur": 180000000,
+              "valuation_date": "2023-06-01",
+              "source": "transfermarkt_dataset",
+              "dataset_version": "sample_2026-07-06",
+              "data_origin": "SAMPLE_FIXTURE"
+            },
+            {
+              "amount_eur": 200000000,
+              "valuation_date": "2024-06-01",
+              "source": "transfermarkt_dataset",
+              "dataset_version": "sample_2026-07-06",
+              "data_origin": "SAMPLE_FIXTURE"
+            },
+            {
+              "amount_eur": 200000000,
+              "valuation_date": "2025-06-01",
+              "source": "transfermarkt_dataset",
+              "dataset_version": "sample_2026-07-06",
+              "data_origin": "SAMPLE_FIXTURE"
+            }
+          ],
+          "latest": {
+            "amount_eur": 200000000,
+            "valuation_date": "2025-06-01",
+            "source": "transfermarkt_dataset",
+            "dataset_version": "sample_2026-07-06",
+            "data_origin": "SAMPLE_FIXTURE"
+          },
+          "meta": {
+            "contract_version": "0.2.0-draft",
+            "generated_at": "2026-09-30T20:30:00Z",
+            "contains_sample_data": true
+          }
+        }
+      },
+      "market_value_ea_only": {
+        "summary": "EA_ONLY: 200 with NOT_MATCHED, never 404, never 0",
+        "value": {
+          "player_id": "ea:209331",
+          "availability": "NOT_MATCHED",
+          "points": [],
+          "latest": null,
+          "meta": {
+            "contract_version": "0.2.0-draft",
+            "generated_at": "2026-09-30T20:30:00Z",
+            "contains_sample_data": false
+          }
+        }
+      },
+      "ea_attributes_salah": {
+        "summary": "Only what the DB really holds; detailed attributes PLANNED/null",
+        "value": {
+          "player_id": "ea:209331",
+          "overall_rating": 91,
+          "potential": 91,
+          "preferred_foot": "Left",
+          "ea_ingame_value": {
+            "availability": "AVAILABLE",
+            "amount_eur": 82000000,
+            "provenance": {
+              "source": "ea_fc26",
+              "dataset_version": "2025-09-19",
+              "fetched_at": "2026-09-30T20:30:44Z",
+              "data_origin": "REAL_FULL"
+            }
+          },
+          "detailed_attributes": {
+            "availability": "NOT_YET_INTEGRATED",
+            "attributes": null
+          },
+          "provenance": {
+            "source": "ea_fc26",
+            "dataset_version": "2025-09-19",
+            "fetched_at": "2026-09-30T20:30:44Z",
+            "data_origin": "REAL_FULL"
+          },
+          "meta": {
+            "contract_version": "0.2.0-draft",
+            "generated_at": "2026-09-30T20:30:00Z",
+            "contains_sample_data": false
+          }
+        }
+      },
+      "injuries_ea_only": {
+        "summary": "EA_ONLY -> NOT_EVALUATED (no injury_data_status row)",
+        "value": {
+          "player_id": "ea:209331",
+          "injury": {
+            "status": "NOT_EVALUATED",
+            "checked_at": null
+          },
+          "records": [],
+          "meta": {
+            "contract_version": "0.2.0-draft",
+            "generated_at": "2026-09-30T20:30:00Z",
+            "contains_sample_data": false
+          }
+        }
+      },
+      "injuries_canonical": {
+        "summary": "Canonical -> NO_SOURCE_AVAILABLE: 'we have no source', not 'no injuries'",
+        "value": {
+          "player_id": "ea:239085",
+          "injury": {
+            "status": "NO_SOURCE_AVAILABLE",
+            "checked_at": "2026-09-30T20:30:47Z"
+          },
+          "records": [],
+          "meta": {
+            "contract_version": "0.2.0-draft",
+            "generated_at": "2026-09-30T20:30:00Z",
+            "contains_sample_data": false
+          }
+        }
+      },
+      "search_vinicius": {
+        "summary": "q=vinicius matches the Transfermarkt alias of EA 'Vini Jr.' (canonical)",
+        "value": {
+          "items": [
+            {
+              "id": "ea:238794",
+              "display_name": "Vini Jr.",
+              "position": "LW",
+              "club": "Real Madrid",
+              "nationality": "Brazil",
+              "date_of_birth": "2000-07-12",
+              "preferred_foot": "Right",
+              "overall_rating": 89,
+              "potential": 92,
+              "identity": {
+                "entity_kind": "CANONICAL",
+                "canonical_player_uid": "bdfaa72e-a493-40b4-a15e-0117251dab30",
+                "source_ids": {
+                  "ea_fc26_id": 238794,
+                  "transfermarkt_id": 371998,
+                  "wikidata_id": null
+                },
+                "links": {
+                  "transfermarkt": {
+                    "status": "PROBABLE_MATCH",
+                    "confidence": 0.8545,
+                    "matched_on": [
+                      "name",
+                      "dob",
+                      "nationality",
+                      "club"
+                    ],
+                    "reference_data_origin": "SAMPLE_FIXTURE",
+                    "review_pending": false
+                  },
+                  "wikidata": {
+                    "status": "NOT_EVALUATED",
+                    "confidence": null,
+                    "matched_on": null,
+                    "reference_data_origin": "SAMPLE_FIXTURE",
+                    "review_pending": false
+                  }
+                }
+              },
+              "image": null,
+              "values": {
+                "ea_ingame_value": {
+                  "availability": "AVAILABLE",
+                  "amount_eur": 141000000,
+                  "provenance": {
+                    "source": "ea_fc26",
+                    "dataset_version": "2025-09-19",
+                    "fetched_at": "2026-09-30T20:30:44Z",
+                    "data_origin": "REAL_FULL"
+                  }
+                },
+                "source_market_value": {
+                  "availability": "AVAILABLE",
+                  "amount_eur": 180000000,
+                  "valuation_date": "2025-06-01",
+                  "provenance": {
+                    "source": "transfermarkt_dataset",
+                    "dataset_version": "sample_2026-07-06",
+                    "fetched_at": "2026-09-30T20:30:46Z",
+                    "data_origin": "SAMPLE_FIXTURE"
+                  }
+                },
+                "model_estimate": {
+                  "availability": "NOT_YET_INTEGRATED",
+                  "target": "EA_INGAME_VALUE",
+                  "amount_eur": null,
+                  "model_version": null
+                }
+              },
+              "injury": {
+                "status": "NO_SOURCE_AVAILABLE",
+                "checked_at": "2026-09-30T20:30:47Z"
+              },
+              "match": {
+                "quality": "PREFIX",
+                "matched_alias": "Vinicius Junior",
+                "matched_alias_source": "transfermarkt_dataset"
+              }
+            }
+          ],
+          "total": 1,
+          "limit": 20,
+          "offset": 0,
+          "next_offset": null,
+          "query_normalized": "vinicius",
+          "meta": {
+            "contract_version": "0.2.0-draft",
+            "generated_at": "2026-09-30T20:30:00Z",
+            "contains_sample_data": true
+          }
+        }
+      },
+      "lineage_vini": {
+        "summary": "Sources disagree on display_name/club: both shown, none merged",
+        "value": {
+          "player_id": "ea:238794",
+          "identity": {
+            "entity_kind": "CANONICAL",
+            "canonical_player_uid": "bdfaa72e-a493-40b4-a15e-0117251dab30",
+            "source_ids": {
+              "ea_fc26_id": 238794,
+              "transfermarkt_id": 371998,
+              "wikidata_id": null
+            },
+            "links": {
+              "transfermarkt": {
+                "status": "PROBABLE_MATCH",
+                "confidence": 0.8545,
+                "matched_on": [
+                  "name",
+                  "dob",
+                  "nationality",
+                  "club"
+                ],
+                "reference_data_origin": "SAMPLE_FIXTURE",
+                "review_pending": false
+              },
+              "wikidata": {
+                "status": "NOT_EVALUATED",
+                "confidence": null,
+                "matched_on": null,
+                "reference_data_origin": "SAMPLE_FIXTURE",
+                "review_pending": false
+              }
+            }
+          },
+          "fields": [
+            {
+              "field_name": "club",
+              "values": [
+                {
+                  "field_value": "Real Madrid",
+                  "source": "ea_fc26",
+                  "dataset_version": "2025-09-19",
+                  "fetched_at": "2026-09-30T20:30:44Z",
+                  "is_current": true,
+                  "data_origin": "REAL_FULL"
+                },
+                {
+                  "field_value": "Real Madrid",
+                  "source": "transfermarkt_dataset",
+                  "dataset_version": "sample_2026-07-06",
+                  "fetched_at": "2026-09-30T20:30:46Z",
+                  "is_current": true,
+                  "data_origin": "SAMPLE_FIXTURE"
+                }
+              ]
+            },
+            {
+              "field_name": "date_of_birth",
+              "values": [
+                {
+                  "field_value": "2000-07-12",
+                  "source": "ea_fc26",
+                  "dataset_version": "2025-09-19",
+                  "fetched_at": "2026-09-30T20:30:44Z",
+                  "is_current": true,
+                  "data_origin": "REAL_FULL"
+                },
+                {
+                  "field_value": "2000-07-12",
+                  "source": "transfermarkt_dataset",
+                  "dataset_version": "sample_2026-07-06",
+                  "fetched_at": "2026-09-30T20:30:46Z",
+                  "is_current": true,
+                  "data_origin": "SAMPLE_FIXTURE"
+                }
+              ]
+            },
+            {
+              "field_name": "display_name",
+              "values": [
+                {
+                  "field_value": "Vini Jr.",
+                  "source": "ea_fc26",
+                  "dataset_version": "2025-09-19",
+                  "fetched_at": "2026-09-30T20:30:44Z",
+                  "is_current": true,
+                  "data_origin": "REAL_FULL"
+                },
+                {
+                  "field_value": "Vinicius Junior",
+                  "source": "transfermarkt_dataset",
+                  "dataset_version": "sample_2026-07-06",
+                  "fetched_at": "2026-09-30T20:30:46Z",
+                  "is_current": true,
+                  "data_origin": "SAMPLE_FIXTURE"
+                }
+              ]
+            },
+            {
+              "field_name": "nationality",
+              "values": [
+                {
+                  "field_value": "Brazil",
+                  "source": "ea_fc26",
+                  "dataset_version": "2025-09-19",
+                  "fetched_at": "2026-09-30T20:30:44Z",
+                  "is_current": true,
+                  "data_origin": "REAL_FULL"
+                },
+                {
+                  "field_value": "Brazil",
+                  "source": "transfermarkt_dataset",
+                  "dataset_version": "sample_2026-07-06",
+                  "fetched_at": "2026-09-30T20:30:46Z",
+                  "is_current": true,
+                  "data_origin": "SAMPLE_FIXTURE"
+                }
+              ]
+            },
+            {
+              "field_name": "position",
+              "values": [
+                {
+                  "field_value": "LW",
+                  "source": "ea_fc26",
+                  "dataset_version": "2025-09-19",
+                  "fetched_at": "2026-09-30T20:30:44Z",
+                  "is_current": true,
+                  "data_origin": "REAL_FULL"
+                },
+                {
+                  "field_value": "Left Winger",
+                  "source": "transfermarkt_dataset",
+                  "dataset_version": "sample_2026-07-06",
+                  "fetched_at": "2026-09-30T20:30:46Z",
+                  "is_current": true,
+                  "data_origin": "SAMPLE_FIXTURE"
+                }
+              ]
+            }
+          ],
+          "meta": {
+            "contract_version": "0.2.0-draft",
+            "generated_at": "2026-09-30T20:30:00Z",
+            "contains_sample_data": true
+          }
+        }
+      },
+      "data_freshness_today": {
+        "summary": "Nothing is live; two of three sources are samples; no injury source; no model",
+        "value": {
+          "sources": [
+            {
+              "role": "PLAYER_ATTRIBUTES",
+              "source": "ea_fc26",
+              "availability": "AVAILABLE",
+              "data_origin": "REAL_FULL",
+              "dataset_version": "2025-09-19",
+              "last_fetched_at": "2026-09-30T20:30:44Z",
+              "record_count": 16107,
+              "is_live": false
+            },
+            {
+              "role": "MARKET_VALUE",
+              "source": "transfermarkt_dataset",
+              "availability": "AVAILABLE",
+              "data_origin": "SAMPLE_FIXTURE",
+              "dataset_version": "sample_2026-07-06",
+              "last_fetched_at": "2026-09-30T20:30:46Z",
+              "record_count": 5,
+              "is_live": false
+            },
+            {
+              "role": "ENRICHMENT",
+              "source": "wikidata",
+              "availability": "AVAILABLE",
+              "data_origin": "SAMPLE_FIXTURE",
+              "dataset_version": "fixture:922e74f46d64",
+              "last_fetched_at": "2026-09-30T20:30:47Z",
+              "record_count": 4,
+              "is_live": false
+            },
+            {
+              "role": "INJURY",
+              "source": null,
+              "availability": "NO_SOURCE_DATA",
+              "data_origin": null,
+              "dataset_version": null,
+              "last_fetched_at": null,
+              "record_count": null,
+              "is_live": false
+            },
+            {
+              "role": "MODEL",
+              "source": null,
+              "availability": "NOT_YET_INTEGRATED",
+              "data_origin": null,
+              "dataset_version": null,
+              "last_fetched_at": null,
+              "record_count": null,
+              "is_live": false
+            }
+          ],
+          "meta": {
+            "contract_version": "0.2.0-draft",
+            "generated_at": "2026-09-30T20:30:00Z",
+            "contains_sample_data": true
+          }
+        }
+      },
+      "health_ok": {
+        "summary": "healthy",
+        "value": {
+          "status": "ok",
+          "database_reachable": true,
+          "contract_version": "0.2.0-draft"
+        }
+      },
+      "problem_invalid_q": {
+        "summary": "q too short",
+        "value": {
+          "type": "about:blank",
+          "title": "Invalid parameter",
+          "status": 400,
+          "code": "INVALID_PARAMETER",
+          "detail": "One or more parameters are invalid.",
+          "instance": "/api/v1/players/search",
+          "errors": [
+            {
+              "parameter": "q",
+              "reason": "length must be between 2 and 80 after trimming"
+            }
+          ]
+        }
+      },
+      "problem_not_found": {
+        "summary": "Well-formed id, no such player",
+        "value": {
+          "type": "about:blank",
+          "title": "Player not found",
+          "status": 404,
+          "code": "PLAYER_NOT_FOUND",
+          "detail": "No player with id ea:1.",
+          "instance": "/api/v1/players/ea:1"
+        }
+      }
+    }
+  },
+  "servers": [
+    {
+      "url": "/api/v1",
+      "description": "planned base path"
+    }
+  ]
+}

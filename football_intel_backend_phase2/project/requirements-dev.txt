@@ -1,0 +1,6 @@
+# Development / test-only dependencies. Production requirements stay in requirements.txt.
+-r requirements.txt
+# tests/test_contract/ and tests/test_api/: validate responses and examples against openapi.json.
+jsonschema==4.26.0
+# HTTP client used by starlette.testclient (starlette >= 1.x deprecates plain `httpx` in favour of `httpx2`).
+httpx2==2.13.1

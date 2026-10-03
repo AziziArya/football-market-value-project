@@ -117,3 +117,59 @@ empirically confirmed the way the ingestion pipeline's performance was
 (Phase 2.3's benchmark).
 **Fix needed**: Re-run once real transfermarkt/wikidata data is
 available; expected to be a non-issue but not yet proven at scale.
+
+## 8. (FIXED) Wikidata fixture rows were labelled `live:<date>`
+
+**What was wrong**: `WikidataProvider.fetch()` only ever reads a local fixture, but stamped
+`dataset_version = "live:<today>"`. **Fix**: stamped `fixture:<today>` (later made `fixture:<content-hash>` by G9); `live:` is reserved for a future
+path that really queries the external endpoint (not implemented).
+**Residual**: a database built BEFORE this fix keeps the old `live:` labels on already-written rows
+(append-only tables). Rebuild the DB (`db/migrate.py` + `scripts/run_ingestion.py` on a fresh file) to clear them.
+
+## 9. (OPEN - planned separate step) `ea_fc26_attributes.raw_json` is never populated
+
+`ingestion/loader.py` inserts the `raw_json` column but the normalizer does not supply it: NULL for all 16,107 rows.
+Detailed EA attributes (pace, finishing, dribbling, ...) are therefore not in the DB; only `overall_rating`, `potential`,
+`value_eur_ingame`. Scheduled as "Backend Data Integrity - EA detailed attributes / raw_json" (raw_json vs typed columns
+vs both). NOT started. The API contract exposes these attributes only as PLANNED/null.
+
+## 10. (FIXED) G9 - re-running ingestion into the same DB created duplicate rows
+
+**What was wrong**: `load_identity_fields` appended the EA and transfermarkt `player_field_values` rows on every run
+(2x, 3x ...), `identity_matches` appended a full new group per EA player on every run, and the Wikidata fixture's
+`dataset_version` contained the run date, so a rerun on another day also duplicated its rows. All duplicated rows were
+`is_current = TRUE`.
+**Fix (no migration)**: idempotency guards in `ingestion/loader.py` (`_drop_already_loaded`) and `matching/loader.py`
+(`drop_unchanged_match_results`, wired in `scripts/run_ingestion.py`); the Wikidata fixture version is now a content hash.
+Tables stay append-only for CHANGED data; nothing is deleted. Invariants: `tests/test_idempotency/`.
+**Residual**: a database built before the fix keeps its old duplicates (never auto-deleted); a rerun does not grow them
+and readers collapse them with the latest-per-key rule (`ARCHITECTURE_API.md` section 4). Rebuild to get a clean file.
+
+## 12. (FIXED) G11 - HealthResponse `unavailable` was unreachable
+
+The contract allowed `HealthResponse.status = "unavailable"`, but `/health` answers 503 with a Problem when unhealthy.
+Fixed in Step 4.2: the contract enum is `["ok"]` (contract 0.3.0-draft); the service raises DATA_UNAVAILABLE.
+
+## 13. (NEW) G12 - transfermarkt id hidden for canonical players whose link is not MATCHED/PROBABLE
+
+The contract exposes `source_ids.transfermarkt_id` only while the link is MATCHED/PROBABLE_MATCH. A player promoted to
+canonical through human review can keep an AMBIGUOUS best match; its id is then hidden. No such player exists in today's data.
+
+## 15. (FIXED) G14 - overall_rating / potential nullable in the database, required by the contract
+
+`ea_fc26_attributes.overall_rating` and `potential` are nullable columns; the contract and the response models require both,
+so a NULL would have produced a 500. Fixed (Step 4.3 verification): startup invariant (fail closed) and `PlayerCore.required`
+aligned in the contract. Today all 16,107 rows have both.
+
+## 14. (DECIDED) G13 - `canonical_player_uid` is not stable
+
+It is a random uuid4 generated per database build, so every rebuild (build-then-swap) changes it. Decision (Step 4.3): the only
+public API identifier is `ea:<ea_fc26_id>`; `p:<uuid>` is never accepted and never returned. The raw field
+`identity.canonical_player_uid` is still exposed as a documented INTERNAL value; whether to remove it from the contract, or to make
+the uid deterministic (data-integrity step), is still open.
+
+## 11. (RESOLVED) G10 - duckdb pin
+
+`requirements.txt` pins `duckdb==1.5.5`. Verified in two clean virtualenvs (1.5.5 and 1.5.6): full suite passes in both,
+a full 16,107-player build gives identical row counts and content hashes, and each version reads the other's file.
+Decision: keep 1.5.5, no change.

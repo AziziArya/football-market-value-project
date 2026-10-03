@@ -22,9 +22,11 @@ coverage reporting → Wikidata enrichment) are **fully implemented and
 tested**. See `CURRENT_STATUS.md` for the exact breakdown and
 `HANDOFF.md` for what a new contributor/agent needs to know first.
 
-**Not built yet, and not claimed to be built**: no API layer, no
-frontend/UI, no ML model integration. This is a data/backend layer
-only. See `NEXT_PHASE.md`.
+**API (Steps 4.1-4.2)**: a read-only FastAPI package `api/` exposes `GET /api/v1/health`,
+`GET /api/v1/data-freshness`, `GET /api/v1/players/search` and `GET /api/v1/players/{player_id}` (see "Running the API").
+**Not built yet, and not claimed to be built**: the other four contract endpoints
+(market value, EA attributes, injuries, lineage), frontend/UI,
+ML model integration, auth/admin. See `ARCHITECTURE_API.md` and `NEXT_PHASE.md`.
 
 ## What Phase 1 and Phase 2 completed
 
@@ -84,12 +86,29 @@ not included in this export — it's a generated artifact, not source)
 and applies any migration in `db/migrations/*.sql` not yet recorded in
 the `schema_migrations` table.
 
+## Running the API (Step 4.1)
+
+```bash
+pip install -r requirements.txt          # production: duckdb, pandas, fastapi, uvicorn, pydantic
+python3 db/migrate.py && python3 scripts/run_ingestion.py     # build the database first (ingestion writes it)
+uvicorn api.app:create_app --factory --port 8000
+curl http://127.0.0.1:8000/api/v1/health
+curl http://127.0.0.1:8000/api/v1/data-freshness
+curl "http://127.0.0.1:8000/api/v1/players/search?q=haaland&limit=5"
+curl http://127.0.0.1:8000/api/v1/players/ea:239085     # the only public id format is ea:<number>
+```
+The API opens the database **read-only** and never writes. A running API holds a lock on the file, so
+ingestion must write a NEW file and you swap it in (build-then-swap, `ARCHITECTURE_API.md` section 4).
+Environment: `FOOTBALL_INTEL_DB_PATH`, `FOOTBALL_INTEL_API_CORS_ORIGINS` (default: none),
+`FOOTBALL_INTEL_API_LOG_LEVEL`, `FOOTBALL_INTEL_API_ENABLE_DOCS` (default false). If the database is missing or fails
+its startup checks the API still starts, but every data endpoint answers `503 DATA_UNAVAILABLE`.
+
 ## Running tests
 
 ```bash
 python3 -m pytest tests/
 ```
-Expected: **190 passed**. No network access needed — all provider tests
+Expected: **527 passed** (install `requirements-dev.txt`; the contract tests need `jsonschema`). No network access needed — all provider tests
 run against local files (the real EA FC26 CSV, included in this export
 at `data/raw/ea_fc26/fc26_merged_clean.csv`, and the labeled sample
 fixtures under `data/raw/transfermarkt_dataset/` and
@@ -127,7 +146,8 @@ See `PROJECT_MANIFEST.md` for a complete file-by-file breakdown.
 
 ## What has NOT been done yet
 
-No API/service layer, no frontend, no UI, no ML model integration. The
+Only health, data-freshness, player search and the player profile exist in the API; no market-value/injury/attributes/lineage
+endpoints, no frontend, no UI, no ML model integration. The
 original university ML model was fully audited (Phase 0) but has not
 been wired into this pipeline. See `KNOWN_ISSUES.md` for a full,
 honest list of current limitations (sample-fixture data volume for two

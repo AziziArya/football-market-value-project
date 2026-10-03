@@ -17,9 +17,9 @@ real data. Nothing beyond this has been started.
 
 ## Exact test count
 
-**190 tests, 0 failures.** Run `python3 -m pytest tests/` to verify —
+**527 tests, 0 failures.** Run `python3 -m pytest tests/` to verify —
 this should be your first action in a new session, before reading
-further or writing any code. If it doesn't say 190 passed, something in
+further or writing any code. If it doesn't say 527 passed, something in
 the repository or environment has changed since this handoff was
 written; investigate that discrepancy before proceeding.
 

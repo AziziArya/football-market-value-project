@@ -1,5 +1,11 @@
 # NEXT PHASE — RECOMMENDATION (not implemented)
 
+> **Status note (Step 4.3):** the API contract (`api_contract/openapi.json`) and the service architecture
+> (`ARCHITECTURE_API.md`) are written, and the API exists for `getHealth`, `getDataFreshness`, `searchPlayers` and `getPlayer` (`api/`).
+> The other four contract endpoints, ML and frontend are NOT built.
+> `/admin/*` endpoints and auth are deferred out of Phase 3. Anything below that mentions them is superseded by the contract.
+
+
 This document describes the recommended next phase based on the actual
 completed backend. Nothing in this document has been built — it is a
 recommendation for the next work session to plan from.

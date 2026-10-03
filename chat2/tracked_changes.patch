@@ -1,0 +1,61 @@
+diff --git a/football_intel_backend_phase2/project/KNOWN_ISSUES.md b/football_intel_backend_phase2/project/KNOWN_ISSUES.md
+index 9abfa77..43786ae 100644
+--- a/football_intel_backend_phase2/project/KNOWN_ISSUES.md
++++ b/football_intel_backend_phase2/project/KNOWN_ISSUES.md
+@@ -117,3 +117,18 @@ empirically confirmed the way the ingestion pipeline's performance was
+ (Phase 2.3's benchmark).
+ **Fix needed**: Re-run once real transfermarkt/wikidata data is
+ available; expected to be a non-issue but not yet proven at scale.
++
++## 8. (FIXED) Wikidata fixture rows were labelled `live:<date>`
++
++**What was wrong**: `WikidataProvider.fetch()` only ever reads a local fixture, but stamped
++`dataset_version = "live:<today>"`. **Fix**: stamped `fixture:<today>`; `live:` is reserved for a future
++path that really queries the external endpoint (not implemented).
++**Residual**: a database built BEFORE this fix keeps the old `live:` labels on already-written rows
++(append-only tables). Rebuild the DB (`db/migrate.py` + `scripts/run_ingestion.py` on a fresh file) to clear them.
++
++## 9. (OPEN - planned separate step) `ea_fc26_attributes.raw_json` is never populated
++
++`ingestion/loader.py` inserts the `raw_json` column but the normalizer does not supply it: NULL for all 16,107 rows.
++Detailed EA attributes (pace, finishing, dribbling, ...) are therefore not in the DB; only `overall_rating`, `potential`,
++`value_eur_ingame`. Scheduled as "Backend Data Integrity - EA detailed attributes / raw_json" (raw_json vs typed columns
++vs both). NOT started. The API contract exposes these attributes only as PLANNED/null.
+diff --git a/football_intel_backend_phase2/project/ingestion/providers/wikidata.py b/football_intel_backend_phase2/project/ingestion/providers/wikidata.py
+index 838e592..d04e79a 100644
+--- a/football_intel_backend_phase2/project/ingestion/providers/wikidata.py
++++ b/football_intel_backend_phase2/project/ingestion/providers/wikidata.py
+@@ -75,11 +75,10 @@ class WikidataProvider(Provider):
+             )
+ 
+         fetched_at = datetime.now(timezone.utc)
+-        # Even fixture-sourced rows are tagged as if pulled live, since that's
+-        # the real provider's actual behaviour — 'live:' prefix distinguishes
+-        # this continuously-edited source from transfermarkt_dataset's frozen
+-        # snapshot dataset_version.
+-        dataset_version = f"live:{fetched_at.date().isoformat()}"
++        # The only reachable code path above reads a LOCAL FIXTURE, so rows are
++        # tagged 'fixture:<date>' - never 'live:'. A 'live:<date>' tag is reserved
++        # for a future code path that actually queries the external endpoint.
++        dataset_version = f"fixture:{fetched_at.date().isoformat()}"
+ 
+         df = pd.read_csv(self.fixture_path)
+         for _, row in df.iterrows():
+diff --git a/football_intel_backend_phase2/project/tests/test_providers/test_wikidata.py b/football_intel_backend_phase2/project/tests/test_providers/test_wikidata.py
+index 4e5a261..f888308 100644
+--- a/football_intel_backend_phase2/project/tests/test_providers/test_wikidata.py
++++ b/football_intel_backend_phase2/project/tests/test_providers/test_wikidata.py
+@@ -40,9 +40,11 @@ def test_fetch_yields_5_records(provider):
+     assert all(r.source == "wikidata" and r.record_type == "player" for r in records)
+ 
+ 
+-def test_dataset_version_is_live_tagged(provider):
++def test_fixture_records_are_fixture_tagged_never_live(provider):
++    """G2: a local fixture read must never be labelled 'live:'."""
+     records = list(provider.fetch())
+-    assert all(r.dataset_version.startswith("live:") for r in records)
++    assert all(r.dataset_version.startswith("fixture:") for r in records)
++    assert not any(r.dataset_version.startswith("live:") for r in records)
+ 
+ 
+ def test_real_verified_haaland_record(provider):

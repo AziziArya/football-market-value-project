@@ -1,0 +1,4 @@
+# Development / test-only dependencies. Production requirements stay in requirements.txt.
+-r requirements.txt
+# Needed by tests/test_contract/ (validates the OpenAPI examples against their schemas).
+jsonschema==4.26.0

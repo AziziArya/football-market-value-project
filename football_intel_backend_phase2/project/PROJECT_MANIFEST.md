@@ -71,6 +71,14 @@ files + 10 data/fixture files).
 |---|---|
 | `coverage_report.py` | `build_coverage_report()` — matching stats, field completeness, lineage coverage, injury status, market-value coverage (kept separate), missing-data summary |
 
+## `api/` — read-only API (`getHealth`, `getDataFreshness`, `searchPlayers`, `getPlayer`)
+
+Layers (see `ARCHITECTURE_API.md`): `app.py` (factory), `config.py`, `errors.py`; `domain/` (enums, models, `normalize`,
+`source_registry`, `link_rules`, `player_index`, `search`, `player_id`; stdlib only); `readmodels/definitions.py` (the ONLY SQL text);
+`repositories/` (read-only DuckDB, RM1/RM2/RM3, freshness, batch player details); `services/` (startup integrity, health, freshness, player summary, search, player);
+`schemas/` (Pydantic, mirrors `api_contract/openapi.json`); `routers/` (thin HTTP). Never imports `ingestion/`, `matching/`, pandas or ML libraries.
+Run: `uvicorn api.app:create_app --factory`.
+
 ## `scripts/` — entrypoints
 
 | File | Role |
@@ -79,7 +87,7 @@ files + 10 data/fixture files).
 | `generate_coverage_report.py` | CLI for the coverage report |
 | `benchmark_loaders.py` | Standalone old-vs-new loader performance comparison (documents the Phase 2.3 185x fix) |
 
-## `tests/` — 190 tests, mirrors the source layout
+## `tests/` — 527 tests, mirrors the source layout
 
 | Path | Covers |
 |---|---|

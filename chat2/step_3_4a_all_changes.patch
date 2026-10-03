@@ -1,0 +1,4046 @@
+diff --git a/football_intel_backend_phase2/project/ARCHITECTURE_API.md b/football_intel_backend_phase2/project/ARCHITECTURE_API.md
+new file mode 100644
+index 0000000..6ab6031
+--- /dev/null
++++ b/football_intel_backend_phase2/project/ARCHITECTURE_API.md
+@@ -0,0 +1,159 @@
++# ARCHITECTURE_API - API service architecture (Step 3.3) - DESIGN ONLY
++
++Status: DRAFT, approved scope = documentation + tests of the documentation. **Nothing here is implemented or installed.**
++Inputs: the real repository, `api_contract/openapi.json` (Steps 3.1/3.2, 8 GET endpoints) and measurements taken on the real
++16,107-player database (section 13). If this document and `openapi.json` disagree, **the contract wins**.
++
++## 0. Scope and non-goals
++In scope: framework choice, layers, dependency rules, read models (logical), search design, errors, config, test strategy, G1/ML decisions, frontend boundary.
++Out of scope (deferred, not designed here): `/admin/*` and any auth, ML integration, G1 implementation, frontend/UI, live or new external data, scraping,
++database migrations, caching/rate-limiting/deployment tooling.
++
++## 1. Principles
++1. Contract-first: `openapi.json` is the product; code conforms to it, never the reverse.
++2. The API is **read-only** with respect to the database and to ingestion.
++3. Honesty over polish: every empty value has an `Availability`; every value carries provenance and `data_origin`; nothing is live (`is_live` = false).
++4. Three value domains never mix: `ea_ingame_value`, `source_market_value`, `model_estimate` (target `EA_INGAME_VALUE`).
++5. No inference: no identity, value, injury, image or attribute is derived for a player that the database does not hold.
++
++## 2. Framework and dependency recommendation (NOT installed)
++| Package | Role | Scope | Version seen on PyPI (2026-10-01) |
++|---|---|---|---|
++| fastapi | HTTP layer, request validation | production | 0.142.2 |
++| uvicorn | ASGI server | production | 0.54.0 |
++| pydantic (v2) | response/request models | production | 2.13.5 |
++| httpx | test client | dev | 0.28.1 |
++| jsonschema | validate responses/examples against `openapi.json` | dev (**added now**, 4.26.0, `requirements-dev.txt`) | 4.26.0 |
++| openapi-typescript (frontend, later) | generate TS types from `openapi.json` | frontend | not checked |
++Versions are informational; pin exactly (`==`, like `requirements.txt`) at implementation time after re-checking.
++Why FastAPI: Python (same runtime as the data layer), Pydantic v2 models, built-in OpenAPI to diff against the contract, async not required but harmless.
++Rejected: Flask (no schema layer), Django (ORM/admin we do not need), a hand-rolled server (no gain).
++Rules: no ORM (DuckDB + plain parameterised SQL in repositories); no pandas in the request path; **no ML libraries (TensorFlow/CatBoost/scikit-learn) in the API runtime**.
++Contract-first mechanics: Pydantic models are written by hand to mirror `openapi.json`; a test compares the app's generated OpenAPI (paths, operationIds, required fields, enums) with the contract, and another validates real responses with `jsonschema`.
++
++## 3. Layers and dependency boundaries (proposed layout, NOT created)
++```
++api/
++  app.py            application factory, startup invariants, exception handlers
++  config.py         ApiConfig (env only)
++  errors.py         exception types -> Problem codes
++  routers/          HTTP only: parse path/query, call a service, return a schema
++  schemas/          Pydantic models mirroring openapi.json (no logic)
++  services/         use-cases: assemble responses, apply Availability rules, no SQL
++  repositories/     the ONLY place with SQL; read-only DuckDB; returns plain typed rows
++  readmodels/       logical read-model definitions + startup loaders (section 5)
++  domain/           pure functions: normalization, match quality, source registry, availability
++```
++| Layer | May import | Must NOT import |
++|---|---|---|
++| routers | services, schemas, errors | repositories, duckdb, domain internals |
++| services | repositories, domain, schemas, errors | duckdb, fastapi, routers |
++| repositories | duckdb, readmodels, domain (types only) | fastapi, schemas, services, routers |
++| domain | stdlib only | everything else (no I/O) |
++| whole `api/` | | `ingestion`, `matching`, `scripts`, `db.migrate`, `reporting`, pandas, ML libraries |
++Enforced by an architecture-fitness test (`tests/test_contract/test_architecture_doc.py`) that scans `api/` as soon as it exists.
++The API reads the database; it never calls the pipeline. It shares only the env var `FOOTBALL_INTEL_DB_PATH`.
++
++## 4. Read-only operation, concurrency and rebuilds
++Measured (DuckDB 1.5.5/1.5.6): several read-only processes can open one file; a read-write open fails with a lock error while a reader holds it.
++Decisions:
++- AD-1 The API opens the database with `read_only=True`, never runs migrations, never writes. A write attempt in a test must fail.
++- AD-2 **Build-then-swap**: ingestion always writes a NEW database file; the API serves a different, finished file; promotion = atomic rename/symlink + API restart/reload. Ingestion never touches the served file.
++- AD-3 One read-only connection per worker process; per-request `cursor()`; no connection per request.
++- AD-4 At startup the API verifies: schema/migrations present, read-model invariants (section 5). On failure it **fails closed**: data endpoints answer 503 `DATA_UNAVAILABLE`, `/health` reports `unavailable`.
++Ingestion is **idempotent** (G9, fixed in Step 3.4a): re-running the same dataset into the same database adds no rows to any table (full real scale: identical row counts after runs 2 and 3). Source tables stay append-only: a CHANGED value (same or new `dataset_version`) is appended, and `identity_matches` appends a new group only when the match outcome changed. Nothing is deleted or edited.
++Build-then-swap remains the deployment rule (clean reproducible files, no writer/reader lock conflicts), but it is no longer needed for correctness.
++Selection rule used by every read model (also for legacy databases built before the fix, which may still hold duplicates and are never auto-cleaned): the **latest row per logical key** - `field values`: key (`source`, `source_record_id`, `field_name`), order `fetched_at DESC, id DESC`; `identity_matches`: latest `is_best` row per `ea_fc26_id`, order `matched_at DESC, id DESC`. `is_current` must NOT be trusted as a selection signal (several rows can be current at once). Executable spec: `tests/test_idempotency/test_g9_rerun_invariants.py`.
++Consequence for freshness: `fetched_at`/`last_fetched_at` is when the currently served data was **first loaded**; a no-op rerun does not advance it.
++
++## 5. SQL read models (logical definitions; no SQL, no views, no migration)
++Each read model is a parameterless SELECT executed by a repository; none is persisted. They produce the contract's `x-source` fields.
++| Read model | Grain | Built from | Rules | Load |
++|---|---|---|---|---|
++| RM1 player_index | 1 row per EA player (16,107) | `ea_fc26_attributes` + latest EA `player_field_values` (display_name, position, club, nationality, date_of_birth, preferred_foot; join `source_record_id` = `ea_fc26_id`) + `v_players` | invariant: exactly one row per `ea_fc26_id`; `entity_kind` = CANONICAL iff a `v_players` row exists; **read `v_players`, never `players`** | in memory at startup |
++| RM2 link_state | 1 row per EA id x {transfermarkt, wikidata} | latest `is_best` row of `identity_matches`, `review_queue` (PENDING), `player_wikidata_links` | confidence/matched_on only for MATCHED/PROBABLE_MATCH; candidate ids never loaded into the API model; wikidata for EA-only = `NOT_EVALUATED`; `reference_data_origin` from the registry | in memory |
++| RM3 alias_index | (ea id, alias, source) | non-EA `display_name` values of CANONICAL players | search only | in memory |
++| RM4 market_value_points | per canonical player | `market_value_history` | order by `valuation_date`, `dataset_version`; `latest` = max date, newest version | on demand (ms) |
++| RM5 injury_state | per canonical player | `injury_data_status`, `injury_records` | absence of a status row = `NOT_EVALUATED` (EA-only); records only when `HAS_RECORDS` | on demand |
++| RM6 image | per canonical player | `player_images` primary | only `source = 'wikidata'`; any other source is dropped and logged (SoFIFA `player_face_url` is never read) | on demand |
++| RM7 freshness | per source | `player_field_values.fetched_at/dataset_version`, `market_value_history.imported_at`, registry | `last_fetched_at` = when the served dataset version was FIRST loaded by us | on demand |
++| lineage | per player | direct query of `player_field_values` | all sources listed, never merged | on demand |
++Indexing: **none needed now.** Measured on the real DB (12.3 MB, 96,679 field rows, 0 indexes): full RM1 pivot 33 ms (once at startup), substring scan 5 ms, per-player lookup 1-3 ms. No migration is proposed in Phase 3; revisit only if data grows by orders of magnitude.
++Search-page payloads come from RM1/RM2 in memory; canonical extras (market value, injury, image) are fetched for the whole page in ONE batched query (`IN (...)`), never N+1.
++
++## 6. Search design (`searchPlayers`)
++Normalization (one pure function used for both the index and the query):
++1. Unicode NFKD, `casefold`. 2. Drop combining marks and format characters (U+00AD soft hyphen is deleted, not turned into a space).
++3. Fold letters NFKD cannot decompose: `ø->o ł->l ı->i æ->ae œ->oe ð->d þ->th đ->d ħ->h` (casefold already gives `ß->ss`).
++4. Replace punctuation/symbol/separator/control characters (categories P, S, Z, C) with a space; keep letters/digits of any script. 5. Collapse and trim whitespace.
++Measured on the real data: NFKD + stripping marks alone leaves **314** of 16,107 names non-ASCII (e.g. "Martin Ødegaard", 3 names with soft hyphens); with steps 1-5 **0**, and none becomes empty.
++Match quality (on normalized strings; the best of EA name and, for CANONICAL players, aliases): `EXACT` (equal) < `PREFIX` (name starts with q) < `TOKEN_PREFIX` (every q token is a prefix of a different name token, any order) < `SUBSTRING` (q occurs in the name). No quality -> not a result.
++`match.matched_alias` is set only when an alias gives a strictly better quality than the EA name (or the EA name does not match at all).
++Duplicate names: measured **124** duplicated exact names, **128** after folding. Results are never merged or deduplicated; each EA player is its own result with a stable `ea:<id>`; the item carries club, nationality, position, date of birth.
++Filters (AND): `entity_kind`; `position`, `nationality`, `club` = casefold equality with the EA value (as in the contract); `min_overall`. Positions in the data: CAM CB CDM CM GK LB LM LW RB RM RW ST.
++Ordering is total: `relevance` = (quality, overall DESC, ea id ASC); `overall_desc` = (overall DESC, ea id ASC); `name_asc` = (normalized name, ea id ASC).
++Pagination: compute the full matching list in memory (measured ~1 ms per scan of 16,107 names in Python), slice `[offset, offset+limit)`; `total` = list length; `next_offset` null on the last page; an offset past the end is `200` with empty `items`. Stable because data only changes on a swap (AD-2).
++EA-only vs canonical: both are searchable; aliases exist only for canonical players; an EA-only player never gains Transfermarkt/Wikidata fields through search.
++
++## 7. Service rules: provenance, freshness, value separation
++- `domain/source_registry`: `ea_fc26 -> REAL_FULL`; `transfermarkt_dataset -> SAMPLE_FIXTURE`; `wikidata -> SAMPLE_FIXTURE`; unknown source -> `UNKNOWN` (never REAL). It is changed deliberately when real data arrives; `dataset_version` text is never parsed for origin.
++- `is_live` is the constant false until a provider with a real endpoint exists. `meta.generated_at` is response time; data age comes only from provenance.
++- `meta.contains_sample_data` = any block in the response has `data_origin = SAMPLE_FIXTURE`.
++- Availability: `NOT_MATCHED` (no link), `NO_SOURCE_DATA` (linked, no value), `NOT_YET_INTEGRATED` (capability missing), else `AVAILABLE`. 404 only for an unknown id.
++- Value separation is structural: three distinct Pydantic classes, no shared `value` field, **no arithmetic between them** (no difference/trend: not in the contract).
++
++## 8. Error handling
++Problem details (RFC 9457) per contract. Mapping: parse/validation failures -> 400 `INVALID_PARAMETER`/`INVALID_PLAYER_ID`; unknown well-formed id -> 404 `PLAYER_NOT_FOUND`;
++DuckDB/IO/schema or startup-invariant failures -> 503 `DATA_UNAVAILABLE`; anything else -> 500 `INTERNAL_ERROR`. `detail` never contains SQL, file paths or stack traces; the full error is logged with a request id.
++
++## 9. Configuration
++Environment variables only, no secrets in this phase: `FOOTBALL_INTEL_DB_PATH` (shared with the pipeline), `FOOTBALL_INTEL_API_CORS_ORIGINS` (default: none), `FOOTBALL_INTEL_API_LOG_LEVEL`, `FOOTBALL_INTEL_API_ENABLE_DOCS` (default false).
++Contract limits (`limit` <= 50, `offset` <= 10000, `q` 2-80) are constants, not configuration, so they cannot drift from the contract. `ApiConfig` is separate from `PipelineConfig`.
++
++## 10. Test strategy
++1. Domain unit tests: normalization (the 314-name table), match quality, ordering. The executable spec is `tests/test_contract/test_search_spec.py`.
++2. Repository tests on the small fixture DB and a full-scale session fixture (16,107 players).
++3. Service tests with in-memory repositories (availability and honesty rules).
++4. Contract tests: every 200/4xx response validated with `jsonschema` against `openapi.json`; golden replays of the 14 contract examples for ea:239085, ea:209331, ea:233097, ea:238794 (timestamps masked); generated OpenAPI vs contract diff.
++5. Honesty invariants at HTTP level (no `live:`, EA-only never gets TM/Wikidata/image, `model_estimate` always NOT_YET_INTEGRATED/`EA_INGAME_VALUE`).
++6. Architecture-fitness tests (import boundaries, no SQL outside repositories, read-only connection), a rerun-robustness test (a DB ingested twice yields identical responses), and a non-gating latency budget.
++
++## 11. Decisions on G1 and ML
++**AD-G1 (decision, not implementation).** `ea_fc26_attributes.raw_json` stays NULL; detailed attributes stay `NOT_YET_INTEGRATED`/`null`.
++- The service depends on a storage-agnostic port (e.g. "EA detail provider") that returns detailed attributes or "none". Today's adapter always returns none; it does not read `raw_json`, any CSV, or the SoFIFA file, and never derives attributes from `overall_rating`.
++- A later, separate step chooses raw_json vs typed columns vs both. The API contract must not change when that happens except for freezing the allowed attribute keys of `detailed_attributes.attributes` (an additive contract change with a version bump).
++- Criteria for that step: typed columns = validated, queryable, needs migration + loader/normalizer/validator + tests; raw_json = full traceability, untyped, larger file; both = double maintenance. Provisional, non-binding lean: typed columns for what the API serves (the 48 numeric features of `feature_list.json` are a candidate list); decide with measurements in that step.
++**AD-ML (decision, not implementation).** Scoring is an offline batch step that runs during the build (before the swap) and fills the existing `predicted_value_eur` / `model_version` columns; the API only reads them.
++- Target is always `EA_INGAME_VALUE` (notebook target `log1p(value_eur)`, inverse `expm1`). Until then: `NOT_YET_INTEGRATED`, null amount, null version.
++- The API never loads a model, never scores on request, never mixes the estimate with EA value or market value, never shows a difference between them.
++- Open prerequisites for that step: the saved pipelines were not loaded in the audit (library versions unverified); reported R2 about 0.998 is on EA's own value; no uncertainty is stored. Explanation/uncertainty endpoints need a contract bump and separate approval.
++
++## 12. API and frontend boundary
++1. The frontend never opens DuckDB or runs SQL; no database file is mounted in a frontend container.
++2. The only shared artifact is `api_contract/openapi.json`; frontend types are generated from it, not hand-copied.
++3. The API has no UI knowledge: no HTML, no UI copy, no display formatting, no layout-driven fields. UI wording for `Availability`, `MatchStatus`, `data_origin` lives in the frontend.
++4. The frontend calls the API from server-side code where possible; CORS is deny-by-default.
++5. Within `/api/v1` only additive changes; a rename, removal or semantic change needs a new contract version and approval. `meta.contract_version` is the handshake.
++6. Frontend must tolerate unknown enum values and must show "LIVE" only if `is_live` is true (never today).
++
++## 13. Evidence (measured 2026-10-01 on this repo, throwaway scripts, not committed)
++DuckDB `1.5.5` (the pinned version; 1.5.6 also verified compatible, see G10). Full DB: 12.3 MB, 96,679 `player_field_values` rows, 16,107 EA players, no indexes.
++Query costs: full pivot 33 ms, substring scan 5 ms, per-player lookup 1.1-2.8 ms. Python scan of 16,107 normalized names ~1 ms.
++Names: 314 non-ASCII after NFKD only, 0 after the spec; 124 duplicate names (128 after folding). Rerun behaviour: section 4 (fixed).
++
++## 14. Known gaps register
++| ID | Status | Gap | Architectural note |
++|---|---|---|---|
++| G1 | OPEN (separate step) | `raw_json` NULL; no detailed EA attributes | AD-G1: port + PLANNED/null; never fabricate |
++| G2 | FIXED | fixture rows were stamped `live:` | now `fixture:<content-hash>` (was `fixture:<date>`, then made content-based by G9); old DBs keep old labels until rebuilt |
++| G3 | KNOWN | EA `dataset_version` hard-coded `2025-09-19`, SoFIFA file dated 2025-09-21 | freshness shows the stored value; fix belongs to the data-integrity step |
++| G4 | KNOWN | duplicated names (124/128) | ids are identity; search never merges |
++| G5 | KNOWN | only 5 players have market value/injury state/image | UI/API must treat EA_ONLY as normal |
++| G6 | KNOWN (by design) | no `players` row for 16,102 EA-only players | `ea:<id>` is the public id; `canonical_player_uid` null |
++| G7 | KNOWN | Transfermarkt/Wikidata/Commons are samples | registry marks SAMPLE_FIXTURE; `contains_sample_data` |
++| G8 | KNOWN | ML slot exists, nothing writes it | AD-ML |
++| G9 | FIXED | re-running ingestion into one DB duplicated EA/TM field rows and `is_best` matches | idempotent loaders (no migration); read models still use latest-per-key; legacy DBs are not auto-cleaned |
++| G10 | RESOLVED | `requirements.txt` pinned duckdb 1.5.5, environment had 1.5.6 | keep `duckdb==1.5.5` (no change): both versions pass the full suite and produce identical, cross-readable databases |
++
++## 15. Proposed next step (needs approval; not started)
++Step 4.1 - API foundation: `api/` skeleton, `ApiConfig`, errors, domain (normalization, registry), read-only repositories + RM1/RM2, startup invariants, `getHealth` and `getDataFreshness`, with contract and architecture tests. Installing FastAPI/uvicorn/pydantic/httpx happens only then, after your approval.
+diff --git a/football_intel_backend_phase2/project/CURRENT_STATUS.md b/football_intel_backend_phase2/project/CURRENT_STATUS.md
+index 6350fc5..a8989de 100644
+--- a/football_intel_backend_phase2/project/CURRENT_STATUS.md
++++ b/football_intel_backend_phase2/project/CURRENT_STATUS.md
+@@ -19,7 +19,7 @@ frontend, UI. See `NEXT_PHASE.md`.
+ 
+ ## Test count
+ 
+-**190 tests, all passing**, across 17 test files. See `TEST_STATUS.md`
++**248 tests, all passing**, across 17+ test files. See `TEST_STATUS.md`
+ for the full breakdown and what each category actually exercises.
+ 
+ ## Real-data validation status
+diff --git a/football_intel_backend_phase2/project/DATABASE_SCHEMA.md b/football_intel_backend_phase2/project/DATABASE_SCHEMA.md
+index 3c588ac..233c89c 100644
+--- a/football_intel_backend_phase2/project/DATABASE_SCHEMA.md
++++ b/football_intel_backend_phase2/project/DATABASE_SCHEMA.md
+@@ -48,8 +48,13 @@ another.
+ **Key columns**: `id` (PK), `player_uid` (nullable — see note),
+ `field_name`, `field_value`, `source`, `source_record_id`, `fetched_at`,
+ `dataset_version`.
+-**Behavior**: append-only, always. Two sources disagreeing on
+-`nationality` produces two rows, not one. `player_uid` is `NULL` at
++**Behavior**: append-only AND idempotent (G9). A row is stored once per
++logical key `(source, source_record_id, field_name, field_value,
++dataset_version)`: re-ingesting the same dataset adds nothing; a changed
++value is appended (the old row is kept). `is_current` is NOT a selection
++criterion (several rows can be current); readers take the latest row per
++`(source, source_record_id, field_name)` by `fetched_at DESC, id DESC`.
++Two sources disagreeing on `nationality` produces two rows, not one. `player_uid` is `NULL` at
+ insert time for EA/transfermarkt rows (matching hasn't run yet) and
+ filled in by `backfill_player_uid()`; wikidata rows get `player_uid` set
+ directly at insert time (enrichment runs after matching).
+@@ -90,9 +95,11 @@ matching — not just the winner.
+ `wikidata_id`, `match_status`, `match_confidence`, `matched_on`,
+ `matched_at`, `match_group_id` (groups all candidates from one
+ `match_one()` call), `is_best` (flags the chosen candidate).
+-**Behavior**: append-only, deliberately. Every pipeline run appends a
+-fresh full set — this table grows on every rerun by design (it's an
+-audit log, not current state). `is_best` + `match_group_id` were added
++**Behavior**: append-only audit log of DISTINCT match outcomes (G9). A
++rerun that produces an identical outcome for an EA id (same candidates,
++statuses, confidences) adds nothing; a changed outcome appends a new
++group and keeps the old one. Readers take the latest `is_best` row per
++`ea_fc26_id` by `matched_at DESC, id DESC`. `is_best` + `match_group_id` were added
+ in migration 0002 specifically so `review_queue` and reporting could
+ find "the one that mattered" without re-deriving it.
+ 
+diff --git a/football_intel_backend_phase2/project/DATA_FLOW.md b/football_intel_backend_phase2/project/DATA_FLOW.md
+index 49cd8b0..bc299eb 100644
+--- a/football_intel_backend_phase2/project/DATA_FLOW.md
++++ b/football_intel_backend_phase2/project/DATA_FLOW.md
+@@ -33,7 +33,7 @@ an aspirational design. Entry point: `python3 scripts/run_ingestion.py`
+    a. Build IdentityInput lists via from_ea_record()/from_transfermarkt_record()
+    b. match_all(ea_identities, tm_identities) -> list[MatchResult]
+       (multi-key blocking: name-prefix OR nationality OR birth-year OR club)
+-   c. persist_identity_matches()   -> identity_matches (append-only, ALL candidates)
++   c. drop_unchanged_match_results() + persist_identity_matches() -> identity_matches (append-only, ALL candidates, only for new/changed outcomes)
+    d. create_player_records()       -> players (only MATCHED/PROBABLE_MATCH promoted)
+    e. persist_review_queue()         -> review_queue (only AMBIGUOUS, deduped)
+    f. backfill_player_uid()           -> fills player_uid on the rows from step 2e
+diff --git a/football_intel_backend_phase2/project/HANDOFF.md b/football_intel_backend_phase2/project/HANDOFF.md
+index 55ce489..653aa94 100644
+--- a/football_intel_backend_phase2/project/HANDOFF.md
++++ b/football_intel_backend_phase2/project/HANDOFF.md
+@@ -17,9 +17,9 @@ real data. Nothing beyond this has been started.
+ 
+ ## Exact test count
+ 
+-**190 tests, 0 failures.** Run `python3 -m pytest tests/` to verify —
++**248 tests, 0 failures.** Run `python3 -m pytest tests/` to verify —
+ this should be your first action in a new session, before reading
+-further or writing any code. If it doesn't say 190 passed, something in
++further or writing any code. If it doesn't say 248 passed, something in
+ the repository or environment has changed since this handoff was
+ written; investigate that discrepancy before proceeding.
+ 
+diff --git a/football_intel_backend_phase2/project/KNOWN_ISSUES.md b/football_intel_backend_phase2/project/KNOWN_ISSUES.md
+index 9abfa77..ccb526b 100644
+--- a/football_intel_backend_phase2/project/KNOWN_ISSUES.md
++++ b/football_intel_backend_phase2/project/KNOWN_ISSUES.md
+@@ -117,3 +117,36 @@ empirically confirmed the way the ingestion pipeline's performance was
+ (Phase 2.3's benchmark).
+ **Fix needed**: Re-run once real transfermarkt/wikidata data is
+ available; expected to be a non-issue but not yet proven at scale.
++
++## 8. (FIXED) Wikidata fixture rows were labelled `live:<date>`
++
++**What was wrong**: `WikidataProvider.fetch()` only ever reads a local fixture, but stamped
++`dataset_version = "live:<today>"`. **Fix**: stamped `fixture:<today>` (later made `fixture:<content-hash>` by G9); `live:` is reserved for a future
++path that really queries the external endpoint (not implemented).
++**Residual**: a database built BEFORE this fix keeps the old `live:` labels on already-written rows
++(append-only tables). Rebuild the DB (`db/migrate.py` + `scripts/run_ingestion.py` on a fresh file) to clear them.
++
++## 9. (OPEN - planned separate step) `ea_fc26_attributes.raw_json` is never populated
++
++`ingestion/loader.py` inserts the `raw_json` column but the normalizer does not supply it: NULL for all 16,107 rows.
++Detailed EA attributes (pace, finishing, dribbling, ...) are therefore not in the DB; only `overall_rating`, `potential`,
++`value_eur_ingame`. Scheduled as "Backend Data Integrity - EA detailed attributes / raw_json" (raw_json vs typed columns
++vs both). NOT started. The API contract exposes these attributes only as PLANNED/null.
++
++## 10. (FIXED) G9 - re-running ingestion into the same DB created duplicate rows
++
++**What was wrong**: `load_identity_fields` appended the EA and transfermarkt `player_field_values` rows on every run
++(2x, 3x ...), `identity_matches` appended a full new group per EA player on every run, and the Wikidata fixture's
++`dataset_version` contained the run date, so a rerun on another day also duplicated its rows. All duplicated rows were
++`is_current = TRUE`.
++**Fix (no migration)**: idempotency guards in `ingestion/loader.py` (`_drop_already_loaded`) and `matching/loader.py`
++(`drop_unchanged_match_results`, wired in `scripts/run_ingestion.py`); the Wikidata fixture version is now a content hash.
++Tables stay append-only for CHANGED data; nothing is deleted. Invariants: `tests/test_idempotency/`.
++**Residual**: a database built before the fix keeps its old duplicates (never auto-deleted); a rerun does not grow them
++and readers collapse them with the latest-per-key rule (`ARCHITECTURE_API.md` section 4). Rebuild to get a clean file.
++
++## 11. (RESOLVED) G10 - duckdb pin
++
++`requirements.txt` pins `duckdb==1.5.5`. Verified in two clean virtualenvs (1.5.5 and 1.5.6): full suite passes in both,
++a full 16,107-player build gives identical row counts and content hashes, and each version reads the other's file.
++Decision: keep 1.5.5, no change.
+diff --git a/football_intel_backend_phase2/project/MATCHING_AND_ENRICHMENT.md b/football_intel_backend_phase2/project/MATCHING_AND_ENRICHMENT.md
+index 6af3cec..0a3c8c4 100644
+--- a/football_intel_backend_phase2/project/MATCHING_AND_ENRICHMENT.md
++++ b/football_intel_backend_phase2/project/MATCHING_AND_ENRICHMENT.md
+@@ -166,9 +166,12 @@ connection from context.
+ Re-running the pipeline against the same data:
+ - `player_wikidata_links`: `already_linked` counted, no new row (PK
+   prevents it anyway).
+-- `player_field_values` (wikidata rows): deduped per
+-  `(player_uid, source='wikidata', dataset_version)` — a same-day rerun
+-  adds nothing.
++- `player_field_values` (ALL sources, since G9): deduped per
++  `(source, source_record_id, field_name, field_value, dataset_version)`;
++  the Wikidata fixture's `dataset_version` is `fixture:<content-hash>`, so
++  re-ingesting it on another day also adds nothing.
++- `identity_matches`: a result identical to the latest stored outcome for
++  that EA id is skipped; a changed outcome is appended (history kept).
+ - `player_images`: deduped per `(player_uid, image_url, source)`.
+ - Verified at real full production scale (16,107 EA players), not just
+   in small unit tests.
+diff --git a/football_intel_backend_phase2/project/NEXT_PHASE.md b/football_intel_backend_phase2/project/NEXT_PHASE.md
+index 014fc16..9e09d4f 100644
+--- a/football_intel_backend_phase2/project/NEXT_PHASE.md
++++ b/football_intel_backend_phase2/project/NEXT_PHASE.md
+@@ -1,5 +1,10 @@
+ # NEXT PHASE — RECOMMENDATION (not implemented)
+ 
++> **Status note (Phase 3 / Step 3.3):** the API contract (`api_contract/openapi.json`) and the service architecture
++> (`ARCHITECTURE_API.md`) are written. No API, framework, ML or frontend has been implemented or installed.
++> `/admin/*` endpoints and auth are deferred out of Phase 3. Anything below that mentions them is superseded by the contract.
++
++
+ This document describes the recommended next phase based on the actual
+ completed backend. Nothing in this document has been built — it is a
+ recommendation for the next work session to plan from.
+diff --git a/football_intel_backend_phase2/project/PROJECT_MANIFEST.md b/football_intel_backend_phase2/project/PROJECT_MANIFEST.md
+index 10d932c..02fa0ad 100644
+--- a/football_intel_backend_phase2/project/PROJECT_MANIFEST.md
++++ b/football_intel_backend_phase2/project/PROJECT_MANIFEST.md
+@@ -79,7 +79,7 @@ files + 10 data/fixture files).
+ | `generate_coverage_report.py` | CLI for the coverage report |
+ | `benchmark_loaders.py` | Standalone old-vs-new loader performance comparison (documents the Phase 2.3 185x fix) |
+ 
+-## `tests/` — 190 tests, mirrors the source layout
++## `tests/` — 248 tests, mirrors the source layout
+ 
+ | Path | Covers |
+ |---|---|
+diff --git a/football_intel_backend_phase2/project/README.md b/football_intel_backend_phase2/project/README.md
+index 47c886b..0cba165 100644
+--- a/football_intel_backend_phase2/project/README.md
++++ b/football_intel_backend_phase2/project/README.md
+@@ -89,7 +89,7 @@ the `schema_migrations` table.
+ ```bash
+ python3 -m pytest tests/
+ ```
+-Expected: **190 passed**. No network access needed — all provider tests
++Expected: **248 passed** (install `requirements-dev.txt`; the contract tests need `jsonschema`). No network access needed — all provider tests
+ run against local files (the real EA FC26 CSV, included in this export
+ at `data/raw/ea_fc26/fc26_merged_clean.csv`, and the labeled sample
+ fixtures under `data/raw/transfermarkt_dataset/` and
+diff --git a/football_intel_backend_phase2/project/TEST_STATUS.md b/football_intel_backend_phase2/project/TEST_STATUS.md
+index 75dc8db..7f82a1b 100644
+--- a/football_intel_backend_phase2/project/TEST_STATUS.md
++++ b/football_intel_backend_phase2/project/TEST_STATUS.md
+@@ -1,6 +1,6 @@
+ # TEST STATUS
+ 
+-**190 tests, 0 failures**, run via `python3 -m pytest tests/`.
++**248 tests, 0 failures**, run via `python3 -m pytest tests/`.
+ Runtime: ~25-35 seconds for the full suite.
+ 
+ This document explains what each category actually exercises — not
+@@ -24,7 +24,9 @@ just that tests exist.
+ | `test_matching/test_review_persistence.py` | 12 | DB-backed queue: persist/list/resolve/promote as 3 separate steps, dedup on rerun, resolve-twice rejected, promote-before-resolve rejected, real conflict refusal |
+ | `test_matching/test_wikidata_matching.py` | 14 | Adapter correctness (`from_wikidata_record`, `build_identity_input_for_player`), and **explicit reuse verification**: no wikidata-specific thresholds/scoring exist anywhere in `matching/identity.py`, enrichment calls the literal same `DEFAULT_THRESHOLDS` object |
+ | `test_matching/test_wikidata_enrichment.py` | 17 | Conflict protection (3 distinct conflict shapes), no-fabrication (zero/multiple candidates, DOB conflict, unrelated person), missing-field NULL handling, idempotent rerun, DB constraint-level protection (`ConstraintException` on attempted re-link/QID-sharing) |
+-| `test_pipeline/test_run_ingestion.py` | 8 | Full real pipeline smoke test, missing-provider abort behavior, `--continue-on-error`, idempotent rerun (append-only tables double, upserted tables don't), **real 16,107-record performance regression guard (<30s ceiling)** |
++| `test_pipeline/test_run_ingestion.py` | 8 | Full real pipeline smoke test, missing-provider abort behavior, `--continue-on-error`, idempotent rerun (ALL tables unchanged since G9), **real 16,107-record performance regression guard (<30s ceiling)** |
++| `test_idempotency/test_g9_rerun_invariants.py` | 9 | G9: rerun adds no rows in any table (also with the fixture's date changed), logical-key uniqueness, changed value / changed match outcome are appended (append-only kept), `is_current` is not a selection criterion, legacy duplicates are not grown/deleted, no new migration |
++| `test_contract/` | see file docstrings | API contract (openapi.json), architecture-doc and search-spec checks. Documentation tests: no API exists |
+ | `test_pipeline/test_wikidata_orchestration.py` | 11 | Enrichment runs only after matching+players exist (verified by inspecting DB state from inside a monkeypatched spy), non-blocking failure modes (missing fixture, fetch exception, mid-enrichment exception), core-failure-still-aborts-before-enrichment, enrichment errors appear in the saved JSON report |
+ | `test_reporting/test_coverage_report.py` | 9 | Synthetic completeness/lineage math, injury-gap detection (seeded a real gap, confirmed it's flagged), value-field separation in the report itself, **real-data smoke test** against an actual pipeline run |
+ 
+diff --git a/football_intel_backend_phase2/project/api_contract/API_CONTRACT.md b/football_intel_backend_phase2/project/api_contract/API_CONTRACT.md
+new file mode 100644
+index 0000000..e5905b5
+--- /dev/null
++++ b/football_intel_backend_phase2/project/api_contract/API_CONTRACT.md
+@@ -0,0 +1,63 @@
++# API contract (Steps 3.1 + 3.2) - DRAFT, CONTRACT ONLY
++
++Machine-readable: `openapi.json` (OpenAPI 3.1, 8 GET endpoints, 40 schemas, 14 examples).
++Checked by `tests/test_contract/` (schema drift, endpoint list, examples validate, honesty invariants).
++**No API is implemented.** `x-status`: `IMPLEMENTABLE_TODAY` (producible from the current DB), `SCHEMA_ONLY` (table exists, empty), `PLANNED` (not produced; always nullable / availability-tagged).
++
++## Decisions
++D1 all 16,107 EA players exposed; 5 `CANONICAL`, 16,102 `EA_ONLY`; nothing inferred for EA-only.
++D2 public id `ea:<ea_fc26_id>` (stable, never changes on later match). `p:<uid>` is an INTERNAL alias: accepted on input, never returned as `id`.
++D3 display fields for everyone come from `player_field_values` (source `ea_fc26`, `source_record_id` = EA id).
++D4 match status (`identity.links.*`) and source data blocks are separate. D5 every empty block has an `Availability`.
++D6 three value blocks: `ea_ingame_value`, `source_market_value`, `model_estimate` (`target: EA_INGAME_VALUE`, PLANNED).
++D7 images: Wikidata/Commons only. D8 `data_origin` from a server-side source registry.
++D9 (3.2) an existing player with no data is `200` + Availability, never 404. D10 (3.2) no derived analytics (trend, prediction difference, injury burden) are in the contract: the backend produces none.
++
++## Exact endpoint list (base path `/api/v1`, all GET)
++| operationId | Path | x-status |
++|---|---|---|
++| getHealth | `/health` | IMPLEMENTABLE_TODAY |
++| getDataFreshness | `/data-freshness` | IMPLEMENTABLE_TODAY |
++| searchPlayers | `/players/search` | IMPLEMENTABLE_TODAY |
++| getPlayer | `/players/{player_id}` | IMPLEMENTABLE_TODAY (model block PLANNED) |
++| getPlayerMarketValue | `/players/{player_id}/market-value` | IMPLEMENTABLE_TODAY (sample data only) |
++| getPlayerEaAttributes | `/players/{player_id}/ea-attributes` | IMPLEMENTABLE_TODAY (detailed attributes PLANNED) |
++| getPlayerInjuries | `/players/{player_id}/injuries` | SCHEMA_ONLY |
++| getPlayerLineage | `/players/{player_id}/lineage` | IMPLEMENTABLE_TODAY |
++
++Deferred, NOT in the contract: `/admin/review-queue`, `/admin/coverage-report` (need an auth design), transfers/appearances endpoints, model-explanation endpoint, real-time anything.
++
++## Search semantics (`/players/search`)
++`q` required, 2-80 chars, normalised (NFKD accent-strip, casefold, collapsed whitespace). Matches EA `display_name` for all players, plus other-source `display_name` for CANONICAL players (reported as `match.matched_alias`). Match quality: `EXACT` < `PREFIX` < `TOKEN_PREFIX` < `SUBSTRING`.
++Filters (AND): `entity_kind`, `position`, `nationality`, `club` (exact, case-insensitive, EA spelling), `min_overall`. Only fields that exist in the DB.
++Sort: `relevance` (quality, overall DESC), `overall_desc`, `name_asc`; every sort ends with `ea_fc26_id ASC` -> total order.
++Paging: `limit` 1-50 (default 20), `offset` 0-10000; response has `total`, `next_offset`. Assumption: data changes only when an ingestion run completes.
++Names are not identifiers (124 duplicated EA names): every item carries club, nationality, position, date of birth, id.
++
++## Error model
++`application/problem+json` (RFC 9457): `type,title,status,code,detail,instance,errors[]`.
++Codes: `INVALID_PARAMETER`(400) `INVALID_PLAYER_ID`(400) `PLAYER_NOT_FOUND`(404, unknown id only) `DATA_UNAVAILABLE`(503) `INTERNAL_ERROR`(500). No SQL, paths or stack traces in `detail`.
++
++## What each kind of player returns today
++| | EA_ONLY | CANONICAL (Haaland) |
++|---|---|---|
++| links.transfermarkt | UNMATCHED or AMBIGUOUS(+review_pending); no candidate ids, no confidence | MATCHED / PROBABLE_MATCH + confidence + matched_on |
++| links.wikidata | NOT_EVALUATED | PROBABLE_MATCH (0.85, fixture) |
++| source_market_value | NOT_MATCHED | AVAILABLE, SAMPLE_FIXTURE |
++| model_estimate | NOT_YET_INTEGRATED | NOT_YET_INTEGRATED |
++| injury | NOT_EVALUATED | NO_SOURCE_AVAILABLE |
++| image | null | Wikidata/Commons if any |
++`UNMATCHED` only means "not found in the reference set", hence `reference_data_origin` (today a 5-player sample).
++Freshness: nothing is live (`is_live` const false); `ea_fc26` REAL_FULL `2025-09-19`; transfermarkt `sample_2026-07-06` and wikidata `fixture:<content-hash>` are SAMPLE_FIXTURE; injury has no source; model not integrated.
++
++## Gaps
++- **G1 (OPEN, separate step)** `ea_fc26_attributes.raw_json` is NULL for all rows -> detailed EA attributes are not in the DB. Contract exposes them only as PLANNED/null.
++- **G2 (FIXED)** fixture rows are now `fixture:<content-hash>`; `live:` reserved for a real endpoint path. Old DBs keep old labels until rebuilt.
++- **G3** EA `dataset_version` hard-coded `2025-09-19` vs SoFIFA file dated 2025-09-21.
++- **G4** duplicated names. **G5** only 5 players have market-value/injury-state/image data.
++- **G6 (new)** no `players` row exists for EA-only players, so `p:` ids and `canonical_player_uid` are null for 16,102 players by design.
++- **G7 (new)** Transfermarkt/Wikidata/Commons data is sample-only, so examples show fixture values (marked SAMPLE_FIXTURE).
++- **G8 (new)** `ea_fc26_attributes.model_version`/`predicted_value_eur` are the ML slot; nothing writes them.
++
++## Planned separate step (NOT started): "Backend Data Integrity - EA detailed attributes / raw_json"
++Decide between (a) storing the real `raw_json` (full traceability, larger DB, untyped), (b) typed columns (queryable/validated, schema migration + loader/normalizer/validator changes, column list must be frozen), (c) both (typed for what the API serves, raw_json for lineage). To evaluate: DB size at 16,107 rows, query speed for search/profile, single source of truth, migration path via a numbered migration (0007), effect on the 190+ tests, and whether `value_eur_ingame`-style naming rules must also cover attributes.
+diff --git a/football_intel_backend_phase2/project/api_contract/openapi.json b/football_intel_backend_phase2/project/api_contract/openapi.json
+new file mode 100644
+index 0000000..fc7bf53
+--- /dev/null
++++ b/football_intel_backend_phase2/project/api_contract/openapi.json
+@@ -0,0 +1,2519 @@
++{
++  "openapi": "3.1.0",
++  "info": {
++    "title": "Football Player Intelligence API - contract",
++    "version": "0.2.0-draft",
++    "description": "CONTRACT ONLY - nothing here is implemented. Step 3.1 (identity/provenance) + Step 3.2 (paths). Every leaf property has x-source (real table/column) or x-derived (rule). x-status: IMPLEMENTABLE_TODAY = producible from the current DB; SCHEMA_ONLY = table exists but is empty; PLANNED = not produced yet, always nullable/availability-tagged. Examples were generated from a local sandbox run of the real pipeline (16,107 EA players + the two sample fixtures); timestamps belong to that run."
++  },
++  "paths": {
++    "/health": {
++      "get": {
++        "operationId": "getHealth",
++        "summary": "Liveness + database reachability (no internals exposed)",
++        "x-status": "IMPLEMENTABLE_TODAY",
++        "parameters": [],
++        "responses": {
++          "200": {
++            "description": "OK",
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/HealthResponse"
++                },
++                "examples": {
++                  "health_ok": {
++                    "$ref": "#/components/examples/health_ok"
++                  }
++                }
++              }
++            }
++          },
++          "503": {
++            "$ref": "#/components/responses/Unavailable"
++          },
++          "500": {
++            "$ref": "#/components/responses/ServerError"
++          }
++        }
++      }
++    },
++    "/data-freshness": {
++      "get": {
++        "operationId": "getDataFreshness",
++        "summary": "Per-source origin, dataset version and ingestion time",
++        "x-status": "IMPLEMENTABLE_TODAY",
++        "parameters": [],
++        "responses": {
++          "200": {
++            "description": "OK",
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/DataFreshnessResponse"
++                },
++                "examples": {
++                  "data_freshness_today": {
++                    "$ref": "#/components/examples/data_freshness_today"
++                  }
++                }
++              }
++            }
++          },
++          "503": {
++            "$ref": "#/components/responses/Unavailable"
++          },
++          "500": {
++            "$ref": "#/components/responses/ServerError"
++          }
++        },
++        "description": "Honest status of every data domain, including the ones that do not exist yet (injury source, model). is_live is always false today."
++      }
++    },
++    "/players/search": {
++      "get": {
++        "operationId": "searchPlayers",
++        "summary": "Search all 16,107 EA players (+ canonical aliases)",
++        "x-status": "IMPLEMENTABLE_TODAY",
++        "parameters": [
++          {
++            "$ref": "#/components/parameters/Q"
++          },
++          {
++            "$ref": "#/components/parameters/EntityKindQ"
++          },
++          {
++            "$ref": "#/components/parameters/PositionQ"
++          },
++          {
++            "$ref": "#/components/parameters/NationalityQ"
++          },
++          {
++            "$ref": "#/components/parameters/ClubQ"
++          },
++          {
++            "$ref": "#/components/parameters/MinOverallQ"
++          },
++          {
++            "$ref": "#/components/parameters/SortQ"
++          },
++          {
++            "$ref": "#/components/parameters/LimitQ"
++          },
++          {
++            "$ref": "#/components/parameters/OffsetQ"
++          }
++        ],
++        "responses": {
++          "200": {
++            "description": "OK",
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/SearchResponse"
++                },
++                "examples": {
++                  "search_vinicius": {
++                    "$ref": "#/components/examples/search_vinicius"
++                  }
++                }
++              }
++            }
++          },
++          "400": {
++            "$ref": "#/components/responses/BadRequest"
++          },
++          "503": {
++            "$ref": "#/components/responses/Unavailable"
++          },
++          "500": {
++            "$ref": "#/components/responses/ServerError"
++          }
++        },
++        "description": "Filters are AND-combined. Names are NOT identifiers (124 EA display names occur more than once), so every item carries club/nationality/position/date_of_birth and a stable id. Each item carries quick EA value, source-market-value availability, injury status and image if any. Model estimate is included as the PLANNED block (NOT_YET_INTEGRATED today)."
++      }
++    },
++    "/players/{player_id}": {
++      "get": {
++        "operationId": "getPlayer",
++        "summary": "Player intelligence profile",
++        "x-status": "IMPLEMENTABLE_TODAY",
++        "parameters": [
++          {
++            "$ref": "#/components/parameters/PlayerIdPath"
++          }
++        ],
++        "responses": {
++          "200": {
++            "description": "OK",
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/PlayerProfile"
++                },
++                "examples": {
++                  "profile_canonical_haaland": {
++                    "$ref": "#/components/examples/profile_canonical_haaland"
++                  },
++                  "profile_ea_only_salah": {
++                    "$ref": "#/components/examples/profile_ea_only_salah"
++                  },
++                  "profile_ea_only_ambiguous": {
++                    "$ref": "#/components/examples/profile_ea_only_ambiguous"
++                  }
++                }
++              }
++            }
++          },
++          "400": {
++            "$ref": "#/components/responses/BadRequest"
++          },
++          "404": {
++            "$ref": "#/components/responses/NotFound"
++          },
++          "503": {
++            "$ref": "#/components/responses/Unavailable"
++          },
++          "500": {
++            "$ref": "#/components/responses/ServerError"
++          }
++        }
++      }
++    },
++    "/players/{player_id}/market-value": {
++      "get": {
++        "operationId": "getPlayerMarketValue",
++        "summary": "Real-world market value history (source data, never the model)",
++        "x-status": "IMPLEMENTABLE_TODAY",
++        "parameters": [
++          {
++            "$ref": "#/components/parameters/PlayerIdPath"
++          }
++        ],
++        "responses": {
++          "200": {
++            "description": "OK",
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/MarketValueResponse"
++                },
++                "examples": {
++                  "market_value_haaland": {
++                    "$ref": "#/components/examples/market_value_haaland"
++                  },
++                  "market_value_ea_only": {
++                    "$ref": "#/components/examples/market_value_ea_only"
++                  }
++                }
++              }
++            }
++          },
++          "400": {
++            "$ref": "#/components/responses/BadRequest"
++          },
++          "404": {
++            "$ref": "#/components/responses/NotFound"
++          },
++          "503": {
++            "$ref": "#/components/responses/Unavailable"
++          },
++          "500": {
++            "$ref": "#/components/responses/ServerError"
++          }
++        }
++      }
++    },
++    "/players/{player_id}/ea-attributes": {
++      "get": {
++        "operationId": "getPlayerEaAttributes",
++        "summary": "EA FC26 attributes that exist in the database",
++        "x-status": "IMPLEMENTABLE_TODAY",
++        "parameters": [
++          {
++            "$ref": "#/components/parameters/PlayerIdPath"
++          }
++        ],
++        "responses": {
++          "200": {
++            "description": "OK",
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/EaAttributesResponse"
++                },
++                "examples": {
++                  "ea_attributes_salah": {
++                    "$ref": "#/components/examples/ea_attributes_salah"
++                  }
++                }
++              }
++            }
++          },
++          "400": {
++            "$ref": "#/components/responses/BadRequest"
++          },
++          "404": {
++            "$ref": "#/components/responses/NotFound"
++          },
++          "503": {
++            "$ref": "#/components/responses/Unavailable"
++          },
++          "500": {
++            "$ref": "#/components/responses/ServerError"
++          }
++        },
++        "description": "overall, potential, preferred foot and EA in-game value only. Detailed attributes are PLANNED (see EaDetailedAttributes)."
++      }
++    },
++    "/players/{player_id}/injuries": {
++      "get": {
++        "operationId": "getPlayerInjuries",
++        "summary": "Injury status (three-state) and records",
++        "x-status": "SCHEMA_ONLY",
++        "parameters": [
++          {
++            "$ref": "#/components/parameters/PlayerIdPath"
++          }
++        ],
++        "responses": {
++          "200": {
++            "description": "OK",
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/InjuriesResponse"
++                },
++                "examples": {
++                  "injuries_ea_only": {
++                    "$ref": "#/components/examples/injuries_ea_only"
++                  },
++                  "injuries_canonical": {
++                    "$ref": "#/components/examples/injuries_canonical"
++                  }
++                }
++              }
++            }
++          },
++          "400": {
++            "$ref": "#/components/responses/BadRequest"
++          },
++          "404": {
++            "$ref": "#/components/responses/NotFound"
++          },
++          "503": {
++            "$ref": "#/components/responses/Unavailable"
++          },
++          "500": {
++            "$ref": "#/components/responses/ServerError"
++          }
++        }
++      }
++    },
++    "/players/{player_id}/lineage": {
++      "get": {
++        "operationId": "getPlayerLineage",
++        "summary": "Per-field, per-source values and link states",
++        "x-status": "IMPLEMENTABLE_TODAY",
++        "parameters": [
++          {
++            "$ref": "#/components/parameters/PlayerIdPath"
++          }
++        ],
++        "responses": {
++          "200": {
++            "description": "OK",
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/LineageResponse"
++                },
++                "examples": {
++                  "lineage_vini": {
++                    "$ref": "#/components/examples/lineage_vini"
++                  }
++                }
++              }
++            }
++          },
++          "400": {
++            "$ref": "#/components/responses/BadRequest"
++          },
++          "404": {
++            "$ref": "#/components/responses/NotFound"
++          },
++          "503": {
++            "$ref": "#/components/responses/Unavailable"
++          },
++          "500": {
++            "$ref": "#/components/responses/ServerError"
++          }
++        }
++      }
++    }
++  },
++  "components": {
++    "schemas": {
++      "EntityKind": {
++        "type": "string",
++        "enum": [
++          "CANONICAL",
++          "EA_ONLY"
++        ],
++        "description": "CANONICAL = a row exists in players (matching produced MATCHED/PROBABLE_MATCH). EA_ONLY = player exists only as an EA FC26 record; NO canonical identity is created or inferred."
++      },
++      "MatchStatus": {
++        "type": "string",
++        "enum": [
++          "MATCHED",
++          "PROBABLE_MATCH",
++          "AMBIGUOUS",
++          "UNMATCHED",
++          "NOT_EVALUATED"
++        ],
++        "description": "First four equal identity_matches.match_status CHECK values. NOT_EVALUATED is API-only: matching was never run for this player against this source (e.g. Wikidata enrichment only iterates canonical players)."
++      },
++      "DataOrigin": {
++        "type": "string",
++        "enum": [
++          "REAL_FULL",
++          "SAMPLE_FIXTURE",
++          "UNKNOWN"
++        ],
++        "x-derived": "server-side source registry keyed by source name (NOT parsed from dataset_version: wikidata fixture rows are currently stamped 'live:<date>', see KNOWN GAP G2)."
++      },
++      "Availability": {
++        "type": "string",
++        "enum": [
++          "AVAILABLE",
++          "NOT_MATCHED",
++          "NO_SOURCE_DATA",
++          "NOT_YET_INTEGRATED"
++        ],
++        "description": "Why a value block is empty. NOT_MATCHED = player has no link to the source. NO_SOURCE_DATA = linked, but source has no value. NOT_YET_INTEGRATED = capability does not exist yet (ML model). Never collapse into null/0. EA detailed attributes use NOT_YET_INTEGRATED too (not stored in the DB yet)."
++      },
++      "InjuryStatus": {
++        "type": "string",
++        "enum": [
++          "NO_SOURCE_AVAILABLE",
++          "CONFIRMED_NO_INJURIES",
++          "HAS_RECORDS",
++          "NOT_EVALUATED"
++        ],
++        "description": "First three equal injury_data_status.status CHECK values. NOT_EVALUATED is API-only: injury_data_status rows exist only for canonical players, so EA_ONLY players have no row."
++      },
++      "PlayerId": {
++        "type": "string",
++        "pattern": "^(ea:[0-9]{1,9}|p:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$",
++        "description": "PUBLIC, STABLE handle: 'ea:<ea_fc26_id>' (works for all 16,107 EA players; never changes when a player later becomes canonical). 'p:<player_uid>' is an INTERNAL alias: accepted on input for canonical players, never returned as `id`."
++      },
++      "SourceProvenance": {
++        "type": "object",
++        "required": [
++          "source",
++          "dataset_version",
++          "data_origin"
++        ],
++        "properties": {
++          "source": {
++            "type": "string",
++            "x-source": {
++              "table": "player_field_values",
++              "column": "source"
++            }
++          },
++          "dataset_version": {
++            "type": [
++              "string",
++              "null"
++            ],
++            "x-source": {
++              "table": "player_field_values",
++              "column": "dataset_version"
++            }
++          },
++          "fetched_at": {
++            "type": [
++              "string",
++              "null"
++            ],
++            "format": "date-time",
++            "x-source": {
++              "table": "player_field_values",
++              "column": "fetched_at"
++            }
++          },
++          "data_origin": {
++            "$ref": "#/components/schemas/DataOrigin"
++          }
++        }
++      },
++      "LinkState": {
++        "type": "object",
++        "description": "State of the link between this player and ONE external source. `confidence`/`matched_on` are present ONLY for MATCHED/PROBABLE_MATCH. For AMBIGUOUS/UNMATCHED/NOT_EVALUATED they are null and candidate ids/names are never exposed (an AMBIGUOUS candidate may already belong to another canonical player).",
++        "required": [
++          "status",
++          "reference_data_origin"
++        ],
++        "properties": {
++          "status": {
++            "$ref": "#/components/schemas/MatchStatus"
++          },
++          "confidence": {
++            "type": [
++              "number",
++              "null"
++            ],
++            "x-source": {
++              "table": "identity_matches",
++              "column": "match_confidence"
++            }
++          },
++          "matched_on": {
++            "type": [
++              "array",
++              "null"
++            ],
++            "items": {
++              "type": "string"
++            },
++            "x-source": {
++              "table": "identity_matches",
++              "column": "matched_on"
++            }
++          },
++          "reference_data_origin": {
++            "$ref": "#/components/schemas/DataOrigin",
++            "description": "What the player was compared AGAINST. UNMATCHED against a SAMPLE_FIXTURE (5 players) means 'not in the sample', not 'not in the real world'."
++          },
++          "review_pending": {
++            "type": "boolean",
++            "x-source": {
++              "table": "review_queue",
++              "column": "status"
++            }
++          }
++        }
++      },
++      "SourceIds": {
++        "type": "object",
++        "required": [
++          "ea_fc26_id"
++        ],
++        "properties": {
++          "ea_fc26_id": {
++            "type": "integer",
++            "x-source": {
++              "table": "ea_fc26_attributes",
++              "column": "ea_fc26_id"
++            }
++          },
++          "transfermarkt_id": {
++            "type": [
++              "integer",
++              "null"
++            ],
++            "x-source": {
++              "table": "v_players",
++              "column": "transfermarkt_id"
++            },
++            "description": "null unless status MATCHED/PROBABLE_MATCH"
++          },
++          "wikidata_id": {
++            "type": [
++              "string",
++              "null"
++            ],
++            "x-source": {
++              "table": "v_players",
++              "column": "wikidata_id"
++            },
++            "description": "null unless linked. Read v_players, never players (DATABASE_SCHEMA.md warning)."
++          }
++        }
++      },
++      "Identity": {
++        "type": "object",
++        "required": [
++          "entity_kind",
++          "source_ids",
++          "links"
++        ],
++        "properties": {
++          "entity_kind": {
++            "$ref": "#/components/schemas/EntityKind"
++          },
++          "canonical_player_uid": {
++            "type": [
++              "string",
++              "null"
++            ],
++            "x-source": {
++              "table": "v_players",
++              "column": "player_uid"
++            }
++          },
++          "source_ids": {
++            "$ref": "#/components/schemas/SourceIds"
++          },
++          "links": {
++            "type": "object",
++            "required": [
++              "transfermarkt",
++              "wikidata"
++            ],
++            "properties": {
++              "transfermarkt": {
++                "$ref": "#/components/schemas/LinkState"
++              },
++              "wikidata": {
++                "$ref": "#/components/schemas/LinkState"
++              }
++            }
++          }
++        }
++      },
++      "EaIngameValue": {
++        "type": "object",
++        "description": "EA FC26 in-game value. NOT a real-world market value.",
++        "required": [
++          "availability"
++        ],
++        "properties": {
++          "availability": {
++            "$ref": "#/components/schemas/Availability"
++          },
++          "amount_eur": {
++            "type": [
++              "integer",
++              "null"
++            ],
++            "x-source": {
++              "table": "ea_fc26_attributes",
++              "column": "value_eur_ingame"
++            }
++          },
++          "provenance": {
++            "oneOf": [
++              {
++                "$ref": "#/components/schemas/SourceProvenance"
++              },
++              {
++                "type": "null"
++              }
++            ]
++          }
++        }
++      },
++      "SourceMarketValue": {
++        "type": "object",
++        "description": "Real-world market value from the market-value source (Transfermarkt dataset). Today: SAMPLE_FIXTURE, 5 players, illustrative amounts.",
++        "required": [
++          "availability"
++        ],
++        "properties": {
++          "availability": {
++            "$ref": "#/components/schemas/Availability"
++          },
++          "amount_eur": {
++            "type": [
++              "integer",
++              "null"
++            ],
++            "x-source": {
++              "table": "market_value_history",
++              "column": "value_eur"
++            }
++          },
++          "valuation_date": {
++            "type": [
++              "string",
++              "null"
++            ],
++            "format": "date",
++            "x-source": {
++              "table": "market_value_history",
++              "column": "valuation_date"
++            }
++          },
++          "provenance": {
++            "oneOf": [
++              {
++                "$ref": "#/components/schemas/SourceProvenance"
++              },
++              {
++                "type": "null"
++              }
++            ]
++          }
++        }
++      },
++      "ModelEstimate": {
++        "type": "object",
++        "description": "ML estimate. Its TARGET is EA in-game value (notebook target log1p(value_eur) from EA/SoFIFA), so it must never be labelled or compared as a market-value prediction without that caveat. PLANNED: the backend does not produce it yet; today availability is always NOT_YET_INTEGRATED and amount_eur/model_version are null.",
++        "required": [
++          "availability",
++          "target"
++        ],
++        "properties": {
++          "availability": {
++            "$ref": "#/components/schemas/Availability"
++          },
++          "target": {
++            "type": "string",
++            "enum": [
++              "EA_INGAME_VALUE"
++            ],
++            "x-derived": "constant; derived from feature_list.json target"
++          },
++          "amount_eur": {
++            "type": [
++              "integer",
++              "null"
++            ],
++            "x-source": {
++              "table": "ea_fc26_attributes",
++              "column": "predicted_value_eur"
++            },
++            "x-status": "PLANNED"
++          },
++          "model_version": {
++            "type": [
++              "string",
++              "null"
++            ],
++            "x-source": {
++              "table": "ea_fc26_attributes",
++              "column": "model_version"
++            },
++            "x-status": "PLANNED"
++          }
++        },
++        "x-status": "PLANNED"
++      },
++      "Values": {
++        "type": "object",
++        "description": "Three separate blocks, never merged, never a generic 'value' field.",
++        "required": [
++          "ea_ingame_value",
++          "source_market_value",
++          "model_estimate"
++        ],
++        "properties": {
++          "ea_ingame_value": {
++            "$ref": "#/components/schemas/EaIngameValue"
++          },
++          "source_market_value": {
++            "$ref": "#/components/schemas/SourceMarketValue"
++          },
++          "model_estimate": {
++            "$ref": "#/components/schemas/ModelEstimate"
++          }
++        }
++      },
++      "InjuryBlock": {
++        "type": "object",
++        "required": [
++          "status"
++        ],
++        "properties": {
++          "status": {
++            "$ref": "#/components/schemas/InjuryStatus"
++          },
++          "checked_at": {
++            "type": [
++              "string",
++              "null"
++            ],
++            "format": "date-time",
++            "x-source": {
++              "table": "injury_data_status",
++              "column": "checked_at"
++            }
++          }
++        }
++      },
++      "PlayerImage": {
++        "type": "object",
++        "description": "Only Wikidata/Commons images are allowed (owner decision). SoFIFA player_face_url is explicitly out of scope.",
++        "required": [
++          "url",
++          "source"
++        ],
++        "properties": {
++          "url": {
++            "type": "string",
++            "x-source": {
++              "table": "player_images",
++              "column": "image_url"
++            }
++          },
++          "source": {
++            "type": "string",
++            "enum": [
++              "wikidata"
++            ],
++            "x-source": {
++              "table": "player_images",
++              "column": "source"
++            }
++          },
++          "license": {
++            "type": [
++              "string",
++              "null"
++            ],
++            "x-source": {
++              "table": "player_images",
++              "column": "license"
++            }
++          },
++          "attribution": {
++            "type": [
++              "string",
++              "null"
++            ],
++            "x-source": {
++              "table": "player_images",
++              "column": "attribution"
++            }
++          }
++        }
++      },
++      "PlayerCore": {
++        "type": "object",
++        "description": "Identity-display fields, each read from player_field_values with source = ea_fc26 (works for EA_ONLY, where player_uid IS NULL and source_record_id = ea_fc26_id).",
++        "required": [
++          "id",
++          "display_name",
++          "identity"
++        ],
++        "properties": {
++          "id": {
++            "$ref": "#/components/schemas/PlayerId"
++          },
++          "display_name": {
++            "type": "string",
++            "x-source": {
++              "table": "player_field_values",
++              "field_name": "display_name",
++              "source": "ea_fc26"
++            }
++          },
++          "position": {
++            "type": [
++              "string",
++              "null"
++            ],
++            "x-source": {
++              "table": "player_field_values",
++              "field_name": "position",
++              "source": "ea_fc26"
++            }
++          },
++          "club": {
++            "type": [
++              "string",
++              "null"
++            ],
++            "x-source": {
++              "table": "player_field_values",
++              "field_name": "club",
++              "source": "ea_fc26"
++            }
++          },
++          "nationality": {
++            "type": [
++              "string",
++              "null"
++            ],
++            "x-source": {
++              "table": "player_field_values",
++              "field_name": "nationality",
++              "source": "ea_fc26"
++            }
++          },
++          "date_of_birth": {
++            "type": [
++              "string",
++              "null"
++            ],
++            "format": "date",
++            "x-source": {
++              "table": "player_field_values",
++              "field_name": "date_of_birth",
++              "source": "ea_fc26"
++            }
++          },
++          "overall_rating": {
++            "type": "integer",
++            "x-source": {
++              "table": "ea_fc26_attributes",
++              "column": "overall_rating"
++            }
++          },
++          "potential": {
++            "type": "integer",
++            "x-source": {
++              "table": "ea_fc26_attributes",
++              "column": "potential"
++            }
++          },
++          "identity": {
++            "$ref": "#/components/schemas/Identity"
++          },
++          "preferred_foot": {
++            "type": [
++              "string",
++              "null"
++            ],
++            "x-source": {
++              "table": "player_field_values",
++              "field_name": "preferred_foot",
++              "source": "ea_fc26"
++            }
++          }
++        }
++      },
++      "PlayerSummary": {
++        "description": "Search/autocomplete item. Carries enough to disambiguate (124 EA display names are duplicated) and to label data honestly.",
++        "allOf": [
++          {
++            "$ref": "#/components/schemas/PlayerCore"
++          },
++          {
++            "type": "object",
++            "required": [
++              "values",
++              "injury"
++            ],
++            "properties": {
++              "image": {
++                "oneOf": [
++                  {
++                    "$ref": "#/components/schemas/PlayerImage"
++                  },
++                  {
++                    "type": "null"
++                  }
++                ]
++              },
++              "values": {
++                "$ref": "#/components/schemas/Values"
++              },
++              "injury": {
++                "$ref": "#/components/schemas/InjuryBlock"
++              }
++            }
++          }
++        ]
++      },
++      "ResponseMeta": {
++        "type": "object",
++        "required": [
++          "contract_version",
++          "generated_at",
++          "contains_sample_data"
++        ],
++        "properties": {
++          "contract_version": {
++            "type": "string",
++            "x-derived": "constant = info.version"
++          },
++          "generated_at": {
++            "type": "string",
++            "format": "date-time",
++            "x-derived": "response time (NOT data freshness; see provenance)"
++          },
++          "contains_sample_data": {
++            "type": "boolean",
++            "x-derived": "true if any block in this response has data_origin = SAMPLE_FIXTURE (source registry)"
++          }
++        }
++      },
++      "ProblemError": {
++        "type": "object",
++        "required": [
++          "parameter",
++          "reason"
++        ],
++        "properties": {
++          "parameter": {
++            "type": "string",
++            "x-derived": "request parameter name"
++          },
++          "reason": {
++            "type": "string",
++            "x-derived": "validation message"
++          }
++        }
++      },
++      "ProblemCode": {
++        "type": "string",
++        "enum": [
++          "INVALID_PARAMETER",
++          "INVALID_PLAYER_ID",
++          "PLAYER_NOT_FOUND",
++          "DATA_UNAVAILABLE",
++          "INTERNAL_ERROR"
++        ]
++      },
++      "Problem": {
++        "type": "object",
++        "description": "RFC 9457 problem details (application/problem+json). 404 is ONLY for an unknown player; a known player with no data is 200 with an Availability, never 404.",
++        "required": [
++          "type",
++          "title",
++          "status",
++          "code"
++        ],
++        "properties": {
++          "type": {
++            "type": "string",
++            "x-derived": "'about:blank' or a documentation URI"
++          },
++          "title": {
++            "type": "string",
++            "x-derived": "short fixed summary per code"
++          },
++          "status": {
++            "type": "integer",
++            "x-derived": "HTTP status"
++          },
++          "code": {
++            "$ref": "#/components/schemas/ProblemCode"
++          },
++          "detail": {
++            "type": [
++              "string",
++              "null"
++            ],
++            "x-derived": "human-readable, never a stack trace/SQL/path"
++          },
++          "instance": {
++            "type": [
++              "string",
++              "null"
++            ],
++            "x-derived": "request path"
++          },
++          "errors": {
++            "type": "array",
++            "items": {
++              "$ref": "#/components/schemas/ProblemError"
++            }
++          }
++        }
++      },
++      "SearchMatchQuality": {
++        "type": "string",
++        "enum": [
++          "EXACT",
++          "PREFIX",
++          "TOKEN_PREFIX",
++          "SUBSTRING"
++        ]
++      },
++      "SearchMatch": {
++        "type": "object",
++        "required": [
++          "quality"
++        ],
++        "properties": {
++          "quality": {
++            "$ref": "#/components/schemas/SearchMatchQuality"
++          },
++          "matched_alias": {
++            "type": [
++              "string",
++              "null"
++            ],
++            "x-source": {
++              "table": "player_field_values",
++              "column": "field_value"
++            },
++            "description": "Set when the query matched a display_name from another source (canonical players only), not the EA name."
++          },
++          "matched_alias_source": {
++            "type": [
++              "string",
++              "null"
++            ],
++            "x-source": {
++              "table": "player_field_values",
++              "column": "source"
++            }
++          }
++        }
++      },
++      "SearchItem": {
++        "allOf": [
++          {
++            "$ref": "#/components/schemas/PlayerSummary"
++          },
++          {
++            "type": "object",
++            "required": [
++              "match"
++            ],
++            "properties": {
++              "match": {
++                "$ref": "#/components/schemas/SearchMatch"
++              }
++            }
++          }
++        ]
++      },
++      "SearchResponse": {
++        "type": "object",
++        "required": [
++          "items",
++          "total",
++          "limit",
++          "offset",
++          "next_offset",
++          "query_normalized",
++          "meta"
++        ],
++        "properties": {
++          "items": {
++            "type": "array",
++            "items": {
++              "$ref": "#/components/schemas/SearchItem"
++            }
++          },
++          "total": {
++            "type": "integer",
++            "x-derived": "exact count of matching players (all pages)"
++          },
++          "limit": {
++            "type": "integer",
++            "x-derived": "echo"
++          },
++          "offset": {
++            "type": "integer",
++            "x-derived": "echo"
++          },
++          "next_offset": {
++            "type": [
++              "integer",
++              "null"
++            ],
++            "x-derived": "offset+limit, or null on the last page"
++          },
++          "query_normalized": {
++            "type": "string",
++            "x-derived": "q after accent-strip/casefold/whitespace-collapse"
++          },
++          "meta": {
++            "$ref": "#/components/schemas/ResponseMeta"
++          }
++        }
++      },
++      "PlayerProfile": {
++        "allOf": [
++          {
++            "$ref": "#/components/schemas/PlayerSummary"
++          },
++          {
++            "type": "object",
++            "required": [
++              "provenance",
++              "meta"
++            ],
++            "properties": {
++              "provenance": {
++                "type": "array",
++                "items": {
++                  "$ref": "#/components/schemas/SourceProvenance"
++                },
++                "description": "One entry per source that contributed ANY block of this response."
++              },
++              "meta": {
++                "$ref": "#/components/schemas/ResponseMeta"
++              }
++            }
++          }
++        ]
++      },
++      "MarketValuePoint": {
++        "type": "object",
++        "required": [
++          "amount_eur",
++          "valuation_date",
++          "dataset_version",
++          "data_origin"
++        ],
++        "properties": {
++          "amount_eur": {
++            "type": "integer",
++            "x-source": {
++              "table": "market_value_history",
++              "column": "value_eur"
++            }
++          },
++          "valuation_date": {
++            "type": "string",
++            "format": "date",
++            "x-source": {
++              "table": "market_value_history",
++              "column": "valuation_date"
++            }
++          },
++          "source": {
++            "type": "string",
++            "x-source": {
++              "table": "market_value_history",
++              "column": "source"
++            }
++          },
++          "dataset_version": {
++            "type": "string",
++            "x-source": {
++              "table": "market_value_history",
++              "column": "dataset_version"
++            }
++          },
++          "data_origin": {
++            "$ref": "#/components/schemas/DataOrigin"
++          }
++        }
++      },
++      "MarketValueResponse": {
++        "type": "object",
++        "required": [
++          "player_id",
++          "availability",
++          "points",
++          "latest",
++          "meta"
++        ],
++        "description": "Real-world market value history (market_value_history). Points are sorted by valuation_date ASC, then dataset_version ASC (the table is append-only across dataset versions, so the same date can appear twice). `latest` = highest valuation_date, ties -> newest dataset_version. No derived trend/difference fields: none is produced by the backend.",
++        "properties": {
++          "player_id": {
++            "$ref": "#/components/schemas/PlayerId"
++          },
++          "availability": {
++            "$ref": "#/components/schemas/Availability"
++          },
++          "points": {
++            "type": "array",
++            "items": {
++              "$ref": "#/components/schemas/MarketValuePoint"
++            }
++          },
++          "latest": {
++            "oneOf": [
++              {
++                "$ref": "#/components/schemas/MarketValuePoint"
++              },
++              {
++                "type": "null"
++              }
++            ]
++          },
++          "meta": {
++            "$ref": "#/components/schemas/ResponseMeta"
++          }
++        }
++      },
++      "EaDetailedAttributes": {
++        "type": "object",
++        "x-status": "PLANNED",
++        "required": [
++          "availability",
++          "attributes"
++        ],
++        "description": "PLANNED. Detailed EA attributes (pace, finishing, dribbling, ...) are NOT stored in the database (ea_fc26_attributes.raw_json is NULL for every row). Today: availability = NOT_YET_INTEGRATED and attributes = null. Tracked as the separate 'Backend Data Integrity - EA detailed attributes' step.",
++        "properties": {
++          "availability": {
++            "$ref": "#/components/schemas/Availability"
++          },
++          "attributes": {
++            "type": [
++              "object",
++              "null"
++            ],
++            "additionalProperties": {
++              "type": "integer"
++            },
++            "x-status": "PLANNED",
++            "x-derived": "null until the data-integrity step stores these values"
++          }
++        }
++      },
++      "EaAttributesResponse": {
++        "type": "object",
++        "required": [
++          "player_id",
++          "overall_rating",
++          "potential",
++          "ea_ingame_value",
++          "detailed_attributes",
++          "provenance",
++          "meta"
++        ],
++        "properties": {
++          "player_id": {
++            "$ref": "#/components/schemas/PlayerId"
++          },
++          "overall_rating": {
++            "type": "integer",
++            "x-source": {
++              "table": "ea_fc26_attributes",
++              "column": "overall_rating"
++            }
++          },
++          "potential": {
++            "type": "integer",
++            "x-source": {
++              "table": "ea_fc26_attributes",
++              "column": "potential"
++            }
++          },
++          "preferred_foot": {
++            "type": [
++              "string",
++              "null"
++            ],
++            "x-source": {
++              "table": "player_field_values",
++              "field_name": "preferred_foot",
++              "source": "ea_fc26"
++            }
++          },
++          "ea_ingame_value": {
++            "$ref": "#/components/schemas/EaIngameValue"
++          },
++          "detailed_attributes": {
++            "$ref": "#/components/schemas/EaDetailedAttributes"
++          },
++          "provenance": {
++            "$ref": "#/components/schemas/SourceProvenance"
++          },
++          "meta": {
++            "$ref": "#/components/schemas/ResponseMeta"
++          }
++        }
++      },
++      "InjuryRecord": {
++        "type": "object",
++        "x-status": "SCHEMA_ONLY",
++        "description": "SCHEMA_ONLY: injury_records table exists but has no writer and no rows. Shape is fixed now; `records` is always [] today.",
++        "properties": {
++          "injury_type": {
++            "type": [
++              "string",
++              "null"
++            ],
++            "x-source": {
++              "table": "injury_records",
++              "column": "injury_type"
++            }
++          },
++          "start_date": {
++            "type": [
++              "string",
++              "null"
++            ],
++            "format": "date",
++            "x-source": {
++              "table": "injury_records",
++              "column": "start_date"
++            }
++          },
++          "expected_return": {
++            "type": [
++              "string",
++              "null"
++            ],
++            "format": "date",
++            "x-source": {
++              "table": "injury_records",
++              "column": "expected_return"
++            }
++          },
++          "actual_return": {
++            "type": [
++              "string",
++              "null"
++            ],
++            "format": "date",
++            "x-source": {
++              "table": "injury_records",
++              "column": "actual_return"
++            }
++          },
++          "days_out": {
++            "type": [
++              "integer",
++              "null"
++            ],
++            "x-source": {
++              "table": "injury_records",
++              "column": "days_out"
++            }
++          },
++          "source": {
++            "type": [
++              "string",
++              "null"
++            ],
++            "x-source": {
++              "table": "injury_records",
++              "column": "source"
++            }
++          }
++        }
++      },
++      "InjuriesResponse": {
++        "type": "object",
++        "required": [
++          "player_id",
++          "injury",
++          "records",
++          "meta"
++        ],
++        "description": "Three-state honesty: `injury.status` is always present. `records` is non-empty ONLY when status = HAS_RECORDS. No derived metrics (burden, frequency): not produced by the backend.",
++        "properties": {
++          "player_id": {
++            "$ref": "#/components/schemas/PlayerId"
++          },
++          "injury": {
++            "$ref": "#/components/schemas/InjuryBlock"
++          },
++          "records": {
++            "type": "array",
++            "items": {
++              "$ref": "#/components/schemas/InjuryRecord"
++            }
++          },
++          "meta": {
++            "$ref": "#/components/schemas/ResponseMeta"
++          }
++        }
++      },
++      "FieldValue": {
++        "type": "object",
++        "required": [
++          "field_value",
++          "source",
++          "data_origin"
++        ],
++        "properties": {
++          "field_value": {
++            "type": "string",
++            "x-source": {
++              "table": "player_field_values",
++              "column": "field_value"
++            }
++          },
++          "source": {
++            "type": "string",
++            "x-source": {
++              "table": "player_field_values",
++              "column": "source"
++            }
++          },
++          "dataset_version": {
++            "type": [
++              "string",
++              "null"
++            ],
++            "x-source": {
++              "table": "player_field_values",
++              "column": "dataset_version"
++            }
++          },
++          "fetched_at": {
++            "type": [
++              "string",
++              "null"
++            ],
++            "format": "date-time",
++            "x-source": {
++              "table": "player_field_values",
++              "column": "fetched_at"
++            }
++          },
++          "is_current": {
++            "type": [
++              "boolean",
++              "null"
++            ],
++            "x-source": {
++              "table": "player_field_values",
++              "column": "is_current"
++            }
++          },
++          "data_origin": {
++            "$ref": "#/components/schemas/DataOrigin"
++          }
++        }
++      },
++      "LineageField": {
++        "type": "object",
++        "required": [
++          "field_name",
++          "values"
++        ],
++        "properties": {
++          "field_name": {
++            "type": "string",
++            "x-source": {
++              "table": "player_field_values",
++              "column": "field_name"
++            }
++          },
++          "values": {
++            "type": "array",
++            "items": {
++              "$ref": "#/components/schemas/FieldValue"
++            },
++            "description": "One entry per source; disagreeing sources are BOTH listed, never merged."
++          }
++        }
++      },
++      "LineageResponse": {
++        "type": "object",
++        "required": [
++          "player_id",
++          "identity",
++          "fields",
++          "meta"
++        ],
++        "properties": {
++          "player_id": {
++            "$ref": "#/components/schemas/PlayerId"
++          },
++          "identity": {
++            "$ref": "#/components/schemas/Identity"
++          },
++          "fields": {
++            "type": "array",
++            "items": {
++              "$ref": "#/components/schemas/LineageField"
++            }
++          },
++          "meta": {
++            "$ref": "#/components/schemas/ResponseMeta"
++          }
++        }
++      },
++      "FreshnessRole": {
++        "type": "string",
++        "enum": [
++          "PLAYER_ATTRIBUTES",
++          "MARKET_VALUE",
++          "ENRICHMENT",
++          "INJURY",
++          "MODEL"
++        ]
++      },
++      "SourceFreshness": {
++        "type": "object",
++        "required": [
++          "role",
++          "availability",
++          "is_live"
++        ],
++        "properties": {
++          "role": {
++            "$ref": "#/components/schemas/FreshnessRole"
++          },
++          "source": {
++            "type": [
++              "string",
++              "null"
++            ],
++            "x-source": {
++              "table": "player_field_values",
++              "column": "source"
++            }
++          },
++          "availability": {
++            "$ref": "#/components/schemas/Availability"
++          },
++          "data_origin": {
++            "oneOf": [
++              {
++                "$ref": "#/components/schemas/DataOrigin"
++              },
++              {
++                "type": "null"
++              }
++            ]
++          },
++          "dataset_version": {
++            "type": [
++              "string",
++              "null"
++            ],
++            "x-source": {
++              "table": "player_field_values",
++              "column": "dataset_version"
++            }
++          },
++          "last_fetched_at": {
++            "type": [
++              "string",
++              "null"
++            ],
++            "format": "date-time",
++            "x-source": {
++              "table": "player_field_values",
++              "column": "fetched_at"
++            },
++            "description": "Latest load timestamp for that source (market value: market_value_history.imported_at). This is when WE first loaded the currently served data (a no-op rerun does not advance it), not when the source last changed."
++          },
++          "record_count": {
++            "type": [
++              "integer",
++              "null"
++            ],
++            "x-derived": "count of source records (players) loaded from that source"
++          },
++          "is_live": {
++            "type": "boolean",
++            "enum": [
++              false
++            ],
++            "x-derived": "constant false: no provider retrieves live data today (live: is reserved for a future real endpoint path)"
++          }
++        }
++      },
++      "DataFreshnessResponse": {
++        "type": "object",
++        "required": [
++          "sources",
++          "meta"
++        ],
++        "properties": {
++          "sources": {
++            "type": "array",
++            "items": {
++              "$ref": "#/components/schemas/SourceFreshness"
++            }
++          },
++          "meta": {
++            "$ref": "#/components/schemas/ResponseMeta"
++          }
++        }
++      },
++      "HealthResponse": {
++        "type": "object",
++        "required": [
++          "status",
++          "database_reachable",
++          "contract_version"
++        ],
++        "properties": {
++          "status": {
++            "type": "string",
++            "enum": [
++              "ok",
++              "unavailable"
++            ],
++            "x-derived": "ok iff database reachable and migrations applied"
++          },
++          "database_reachable": {
++            "type": "boolean",
++            "x-derived": "a trivial read succeeded"
++          },
++          "contract_version": {
++            "type": "string",
++            "x-derived": "constant = info.version"
++          }
++        }
++      }
++    },
++    "parameters": {
++      "PlayerIdPath": {
++        "name": "player_id",
++        "in": "path",
++        "required": true,
++        "schema": {
++          "$ref": "#/components/schemas/PlayerId"
++        },
++        "description": "Use ea:<id>. p:<uid> is an internal alias."
++      },
++      "Q": {
++        "name": "q",
++        "in": "query",
++        "required": true,
++        "schema": {
++          "type": "string",
++          "minLength": 2,
++          "maxLength": 80
++        },
++        "description": "Trimmed, then normalised (Unicode NFKD accent-strip, casefold, whitespace collapsed). Matched against the EA display_name of every player and, for CANONICAL players only, display_name values from other sources (reported in match.matched_alias)."
++      },
++      "EntityKindQ": {
++        "name": "entity_kind",
++        "in": "query",
++        "schema": {
++          "$ref": "#/components/schemas/EntityKind"
++        }
++      },
++      "PositionQ": {
++        "name": "position",
++        "in": "query",
++        "schema": {
++          "type": "string",
++          "maxLength": 8
++        },
++        "description": "Exact EA position code (case-insensitive)."
++      },
++      "NationalityQ": {
++        "name": "nationality",
++        "in": "query",
++        "schema": {
++          "type": "string",
++          "maxLength": 60
++        },
++        "description": "Exact, case-insensitive, EA spelling (e.g. 'Holland')."
++      },
++      "ClubQ": {
++        "name": "club",
++        "in": "query",
++        "schema": {
++          "type": "string",
++          "maxLength": 80
++        },
++        "description": "Exact, case-insensitive, EA club name."
++      },
++      "MinOverallQ": {
++        "name": "min_overall",
++        "in": "query",
++        "schema": {
++          "type": "integer",
++          "minimum": 0,
++          "maximum": 99
++        }
++      },
++      "SortQ": {
++        "name": "sort",
++        "in": "query",
++        "schema": {
++          "type": "string",
++          "enum": [
++            "relevance",
++            "overall_desc",
++            "name_asc"
++          ],
++          "default": "relevance"
++        },
++        "description": "relevance = match quality (EXACT<PREFIX<TOKEN_PREFIX<SUBSTRING), then overall_rating DESC, then ea_fc26_id ASC. All sorts end with ea_fc26_id ASC, so order is total and paging is stable."
++      },
++      "LimitQ": {
++        "name": "limit",
++        "in": "query",
++        "schema": {
++          "type": "integer",
++          "minimum": 1,
++          "maximum": 50,
++          "default": 20
++        }
++      },
++      "OffsetQ": {
++        "name": "offset",
++        "in": "query",
++        "schema": {
++          "type": "integer",
++          "minimum": 0,
++          "maximum": 10000,
++          "default": 0
++        },
++        "description": "Offset paging. ASSUMPTION: data changes only when an ingestion run completes, so offsets are stable between runs."
++      }
++    },
++    "responses": {
++      "BadRequest": {
++        "description": "INVALID_PARAMETER or INVALID_PLAYER_ID.",
++        "content": {
++          "application/problem+json": {
++            "schema": {
++              "$ref": "#/components/schemas/Problem"
++            }
++          }
++        }
++      },
++      "NotFound": {
++        "description": "PLAYER_NOT_FOUND - id is well-formed but no such EA player / canonical uid.",
++        "content": {
++          "application/problem+json": {
++            "schema": {
++              "$ref": "#/components/schemas/Problem"
++            }
++          }
++        }
++      },
++      "Unavailable": {
++        "description": "DATA_UNAVAILABLE - database unreachable or migrations not applied.",
++        "content": {
++          "application/problem+json": {
++            "schema": {
++              "$ref": "#/components/schemas/Problem"
++            }
++          }
++        }
++      },
++      "ServerError": {
++        "description": "INTERNAL_ERROR.",
++        "content": {
++          "application/problem+json": {
++            "schema": {
++              "$ref": "#/components/schemas/Problem"
++            }
++          }
++        }
++      }
++    },
++    "examples": {
++      "profile_canonical_haaland": {
++        "summary": "CANONICAL player: Transfermarkt MATCHED (sample), Wikidata PROBABLE_MATCH (sample), Commons image",
++        "value": {
++          "id": "ea:239085",
++          "display_name": "Erling Haaland",
++          "position": "ST",
++          "club": "Manchester City",
++          "nationality": "Norway",
++          "date_of_birth": "2000-07-21",
++          "preferred_foot": "Left",
++          "overall_rating": 90,
++          "potential": 92,
++          "identity": {
++            "entity_kind": "CANONICAL",
++            "canonical_player_uid": "1b9f4774-32cc-4fca-b62d-61d2a33be78b",
++            "source_ids": {
++              "ea_fc26_id": 239085,
++              "transfermarkt_id": 418560,
++              "wikidata_id": "Q28967995"
++            },
++            "links": {
++              "transfermarkt": {
++                "status": "MATCHED",
++                "confidence": 1.0,
++                "matched_on": [
++                  "name",
++                  "dob",
++                  "nationality",
++                  "club"
++                ],
++                "reference_data_origin": "SAMPLE_FIXTURE",
++                "review_pending": false
++              },
++              "wikidata": {
++                "status": "PROBABLE_MATCH",
++                "confidence": 0.85,
++                "matched_on": [
++                  "name",
++                  "dob",
++                  "nationality"
++                ],
++                "reference_data_origin": "SAMPLE_FIXTURE",
++                "review_pending": false
++              }
++            }
++          },
++          "image": {
++            "url": "https://commons.wikimedia.org/wiki/Special:FilePath/Erling_Haaland_Morocco_v_Norway_7_June_2026-51.jpg",
++            "source": "wikidata",
++            "license": null,
++            "attribution": "Bryan Berlin"
++          },
++          "values": {
++            "ea_ingame_value": {
++              "availability": "AVAILABLE",
++              "amount_eur": 157000000,
++              "provenance": {
++                "source": "ea_fc26",
++                "dataset_version": "2025-09-19",
++                "fetched_at": "2026-09-30T20:30:44Z",
++                "data_origin": "REAL_FULL"
++              }
++            },
++            "source_market_value": {
++              "availability": "AVAILABLE",
++              "amount_eur": 200000000,
++              "valuation_date": "2025-06-01",
++              "provenance": {
++                "source": "transfermarkt_dataset",
++                "dataset_version": "sample_2026-07-06",
++                "fetched_at": "2026-09-30T20:30:46Z",
++                "data_origin": "SAMPLE_FIXTURE"
++              }
++            },
++            "model_estimate": {
++              "availability": "NOT_YET_INTEGRATED",
++              "target": "EA_INGAME_VALUE",
++              "amount_eur": null,
++              "model_version": null
++            }
++          },
++          "injury": {
++            "status": "NO_SOURCE_AVAILABLE",
++            "checked_at": "2026-09-30T20:30:47Z"
++          },
++          "provenance": [
++            {
++              "source": "ea_fc26",
++              "dataset_version": "2025-09-19",
++              "fetched_at": "2026-09-30T20:30:44Z",
++              "data_origin": "REAL_FULL"
++            },
++            {
++              "source": "transfermarkt_dataset",
++              "dataset_version": "sample_2026-07-06",
++              "fetched_at": "2026-09-30T20:30:46Z",
++              "data_origin": "SAMPLE_FIXTURE"
++            },
++            {
++              "source": "wikidata",
++              "dataset_version": "fixture:922e74f46d64",
++              "fetched_at": "2026-09-30T20:30:47Z",
++              "data_origin": "SAMPLE_FIXTURE"
++            }
++          ],
++          "meta": {
++            "contract_version": "0.2.0-draft",
++            "generated_at": "2026-09-30T20:30:00Z",
++            "contains_sample_data": true
++          }
++        }
++      },
++      "profile_ea_only_salah": {
++        "summary": "EA_ONLY player: nothing inferred - market value NOT_MATCHED, injury NOT_EVALUATED, no image",
++        "value": {
++          "id": "ea:209331",
++          "display_name": "Mohamed Salah",
++          "position": "RM",
++          "club": "Liverpool",
++          "nationality": "Egypt",
++          "date_of_birth": "1992-06-15",
++          "preferred_foot": "Left",
++          "overall_rating": 91,
++          "potential": 91,
++          "identity": {
++            "entity_kind": "EA_ONLY",
++            "canonical_player_uid": null,
++            "source_ids": {
++              "ea_fc26_id": 209331,
++              "transfermarkt_id": null,
++              "wikidata_id": null
++            },
++            "links": {
++              "transfermarkt": {
++                "status": "UNMATCHED",
++                "confidence": null,
++                "matched_on": null,
++                "reference_data_origin": "SAMPLE_FIXTURE",
++                "review_pending": false
++              },
++              "wikidata": {
++                "status": "NOT_EVALUATED",
++                "confidence": null,
++                "matched_on": null,
++                "reference_data_origin": "SAMPLE_FIXTURE",
++                "review_pending": false
++              }
++            }
++          },
++          "image": null,
++          "values": {
++            "ea_ingame_value": {
++              "availability": "AVAILABLE",
++              "amount_eur": 82000000,
++              "provenance": {
++                "source": "ea_fc26",
++                "dataset_version": "2025-09-19",
++                "fetched_at": "2026-09-30T20:30:44Z",
++                "data_origin": "REAL_FULL"
++              }
++            },
++            "source_market_value": {
++              "availability": "NOT_MATCHED",
++              "amount_eur": null,
++              "valuation_date": null,
++              "provenance": null
++            },
++            "model_estimate": {
++              "availability": "NOT_YET_INTEGRATED",
++              "target": "EA_INGAME_VALUE",
++              "amount_eur": null,
++              "model_version": null
++            }
++          },
++          "injury": {
++            "status": "NOT_EVALUATED",
++            "checked_at": null
++          },
++          "provenance": [
++            {
++              "source": "ea_fc26",
++              "dataset_version": "2025-09-19",
++              "fetched_at": "2026-09-30T20:30:44Z",
++              "data_origin": "REAL_FULL"
++            }
++          ],
++          "meta": {
++            "contract_version": "0.2.0-draft",
++            "generated_at": "2026-09-30T20:30:00Z",
++            "contains_sample_data": false
++          }
++        }
++      },
++      "profile_ea_only_ambiguous": {
++        "summary": "EA_ONLY with an AMBIGUOUS Transfermarkt review pending: status only, candidate ids never exposed",
++        "value": {
++          "id": "ea:233097",
++          "display_name": "Rick van Drongelen",
++          "position": "CB",
++          "club": "Samsunspor",
++          "nationality": "Holland",
++          "date_of_birth": "1998-12-20",
++          "preferred_foot": "Left",
++          "overall_rating": 74,
++          "potential": 79,
++          "identity": {
++            "entity_kind": "EA_ONLY",
++            "canonical_player_uid": null,
++            "source_ids": {
++              "ea_fc26_id": 233097,
++              "transfermarkt_id": null,
++              "wikidata_id": null
++            },
++            "links": {
++              "transfermarkt": {
++                "status": "AMBIGUOUS",
++                "confidence": null,
++                "matched_on": null,
++                "reference_data_origin": "SAMPLE_FIXTURE",
++                "review_pending": true
++              },
++              "wikidata": {
++                "status": "NOT_EVALUATED",
++                "confidence": null,
++                "matched_on": null,
++                "reference_data_origin": "SAMPLE_FIXTURE",
++                "review_pending": false
++              }
++            }
++          },
++          "image": null,
++          "values": {
++            "ea_ingame_value": {
++              "availability": "AVAILABLE",
++              "amount_eur": 7000000,
++              "provenance": {
++                "source": "ea_fc26",
++                "dataset_version": "2025-09-19",
++                "fetched_at": "2026-09-30T20:30:44Z",
++                "data_origin": "REAL_FULL"
++              }
++            },
++            "source_market_value": {
++              "availability": "NOT_MATCHED",
++              "amount_eur": null,
++              "valuation_date": null,
++              "provenance": null
++            },
++            "model_estimate": {
++              "availability": "NOT_YET_INTEGRATED",
++              "target": "EA_INGAME_VALUE",
++              "amount_eur": null,
++              "model_version": null
++            }
++          },
++          "injury": {
++            "status": "NOT_EVALUATED",
++            "checked_at": null
++          },
++          "provenance": [
++            {
++              "source": "ea_fc26",
++              "dataset_version": "2025-09-19",
++              "fetched_at": "2026-09-30T20:30:44Z",
++              "data_origin": "REAL_FULL"
++            }
++          ],
++          "meta": {
++            "contract_version": "0.2.0-draft",
++            "generated_at": "2026-09-30T20:30:00Z",
++            "contains_sample_data": false
++          }
++        }
++      },
++      "market_value_haaland": {
++        "summary": "Sample-fixture history (illustrative amounts), ascending by date",
++        "value": {
++          "player_id": "ea:239085",
++          "availability": "AVAILABLE",
++          "points": [
++            {
++              "amount_eur": 180000000,
++              "valuation_date": "2023-06-01",
++              "source": "transfermarkt_dataset",
++              "dataset_version": "sample_2026-07-06",
++              "data_origin": "SAMPLE_FIXTURE"
++            },
++            {
++              "amount_eur": 200000000,
++              "valuation_date": "2024-06-01",
++              "source": "transfermarkt_dataset",
++              "dataset_version": "sample_2026-07-06",
++              "data_origin": "SAMPLE_FIXTURE"
++            },
++            {
++              "amount_eur": 200000000,
++              "valuation_date": "2025-06-01",
++              "source": "transfermarkt_dataset",
++              "dataset_version": "sample_2026-07-06",
++              "data_origin": "SAMPLE_FIXTURE"
++            }
++          ],
++          "latest": {
++            "amount_eur": 200000000,
++            "valuation_date": "2025-06-01",
++            "source": "transfermarkt_dataset",
++            "dataset_version": "sample_2026-07-06",
++            "data_origin": "SAMPLE_FIXTURE"
++          },
++          "meta": {
++            "contract_version": "0.2.0-draft",
++            "generated_at": "2026-09-30T20:30:00Z",
++            "contains_sample_data": true
++          }
++        }
++      },
++      "market_value_ea_only": {
++        "summary": "EA_ONLY: 200 with NOT_MATCHED, never 404, never 0",
++        "value": {
++          "player_id": "ea:209331",
++          "availability": "NOT_MATCHED",
++          "points": [],
++          "latest": null,
++          "meta": {
++            "contract_version": "0.2.0-draft",
++            "generated_at": "2026-09-30T20:30:00Z",
++            "contains_sample_data": false
++          }
++        }
++      },
++      "ea_attributes_salah": {
++        "summary": "Only what the DB really holds; detailed attributes PLANNED/null",
++        "value": {
++          "player_id": "ea:209331",
++          "overall_rating": 91,
++          "potential": 91,
++          "preferred_foot": "Left",
++          "ea_ingame_value": {
++            "availability": "AVAILABLE",
++            "amount_eur": 82000000,
++            "provenance": {
++              "source": "ea_fc26",
++              "dataset_version": "2025-09-19",
++              "fetched_at": "2026-09-30T20:30:44Z",
++              "data_origin": "REAL_FULL"
++            }
++          },
++          "detailed_attributes": {
++            "availability": "NOT_YET_INTEGRATED",
++            "attributes": null
++          },
++          "provenance": {
++            "source": "ea_fc26",
++            "dataset_version": "2025-09-19",
++            "fetched_at": "2026-09-30T20:30:44Z",
++            "data_origin": "REAL_FULL"
++          },
++          "meta": {
++            "contract_version": "0.2.0-draft",
++            "generated_at": "2026-09-30T20:30:00Z",
++            "contains_sample_data": false
++          }
++        }
++      },
++      "injuries_ea_only": {
++        "summary": "EA_ONLY -> NOT_EVALUATED (no injury_data_status row)",
++        "value": {
++          "player_id": "ea:209331",
++          "injury": {
++            "status": "NOT_EVALUATED",
++            "checked_at": null
++          },
++          "records": [],
++          "meta": {
++            "contract_version": "0.2.0-draft",
++            "generated_at": "2026-09-30T20:30:00Z",
++            "contains_sample_data": false
++          }
++        }
++      },
++      "injuries_canonical": {
++        "summary": "Canonical -> NO_SOURCE_AVAILABLE: 'we have no source', not 'no injuries'",
++        "value": {
++          "player_id": "ea:239085",
++          "injury": {
++            "status": "NO_SOURCE_AVAILABLE",
++            "checked_at": "2026-09-30T20:30:47Z"
++          },
++          "records": [],
++          "meta": {
++            "contract_version": "0.2.0-draft",
++            "generated_at": "2026-09-30T20:30:00Z",
++            "contains_sample_data": false
++          }
++        }
++      },
++      "search_vinicius": {
++        "summary": "q=vinicius matches the Transfermarkt alias of EA 'Vini Jr.' (canonical)",
++        "value": {
++          "items": [
++            {
++              "id": "ea:238794",
++              "display_name": "Vini Jr.",
++              "position": "LW",
++              "club": "Real Madrid",
++              "nationality": "Brazil",
++              "date_of_birth": "2000-07-12",
++              "preferred_foot": "Right",
++              "overall_rating": 89,
++              "potential": 92,
++              "identity": {
++                "entity_kind": "CANONICAL",
++                "canonical_player_uid": "bdfaa72e-a493-40b4-a15e-0117251dab30",
++                "source_ids": {
++                  "ea_fc26_id": 238794,
++                  "transfermarkt_id": 371998,
++                  "wikidata_id": null
++                },
++                "links": {
++                  "transfermarkt": {
++                    "status": "PROBABLE_MATCH",
++                    "confidence": 0.8545,
++                    "matched_on": [
++                      "name",
++                      "dob",
++                      "nationality",
++                      "club"
++                    ],
++                    "reference_data_origin": "SAMPLE_FIXTURE",
++                    "review_pending": false
++                  },
++                  "wikidata": {
++                    "status": "NOT_EVALUATED",
++                    "confidence": null,
++                    "matched_on": null,
++                    "reference_data_origin": "SAMPLE_FIXTURE",
++                    "review_pending": false
++                  }
++                }
++              },
++              "image": null,
++              "values": {
++                "ea_ingame_value": {
++                  "availability": "AVAILABLE",
++                  "amount_eur": 141000000,
++                  "provenance": {
++                    "source": "ea_fc26",
++                    "dataset_version": "2025-09-19",
++                    "fetched_at": "2026-09-30T20:30:44Z",
++                    "data_origin": "REAL_FULL"
++                  }
++                },
++                "source_market_value": {
++                  "availability": "AVAILABLE",
++                  "amount_eur": 180000000,
++                  "valuation_date": "2025-06-01",
++                  "provenance": {
++                    "source": "transfermarkt_dataset",
++                    "dataset_version": "sample_2026-07-06",
++                    "fetched_at": "2026-09-30T20:30:46Z",
++                    "data_origin": "SAMPLE_FIXTURE"
++                  }
++                },
++                "model_estimate": {
++                  "availability": "NOT_YET_INTEGRATED",
++                  "target": "EA_INGAME_VALUE",
++                  "amount_eur": null,
++                  "model_version": null
++                }
++              },
++              "injury": {
++                "status": "NO_SOURCE_AVAILABLE",
++                "checked_at": "2026-09-30T20:30:47Z"
++              },
++              "match": {
++                "quality": "PREFIX",
++                "matched_alias": "Vinicius Junior",
++                "matched_alias_source": "transfermarkt_dataset"
++              }
++            }
++          ],
++          "total": 1,
++          "limit": 20,
++          "offset": 0,
++          "next_offset": null,
++          "query_normalized": "vinicius",
++          "meta": {
++            "contract_version": "0.2.0-draft",
++            "generated_at": "2026-09-30T20:30:00Z",
++            "contains_sample_data": true
++          }
++        }
++      },
++      "lineage_vini": {
++        "summary": "Sources disagree on display_name/club: both shown, none merged",
++        "value": {
++          "player_id": "ea:238794",
++          "identity": {
++            "entity_kind": "CANONICAL",
++            "canonical_player_uid": "bdfaa72e-a493-40b4-a15e-0117251dab30",
++            "source_ids": {
++              "ea_fc26_id": 238794,
++              "transfermarkt_id": 371998,
++              "wikidata_id": null
++            },
++            "links": {
++              "transfermarkt": {
++                "status": "PROBABLE_MATCH",
++                "confidence": 0.8545,
++                "matched_on": [
++                  "name",
++                  "dob",
++                  "nationality",
++                  "club"
++                ],
++                "reference_data_origin": "SAMPLE_FIXTURE",
++                "review_pending": false
++              },
++              "wikidata": {
++                "status": "NOT_EVALUATED",
++                "confidence": null,
++                "matched_on": null,
++                "reference_data_origin": "SAMPLE_FIXTURE",
++                "review_pending": false
++              }
++            }
++          },
++          "fields": [
++            {
++              "field_name": "club",
++              "values": [
++                {
++                  "field_value": "Real Madrid",
++                  "source": "ea_fc26",
++                  "dataset_version": "2025-09-19",
++                  "fetched_at": "2026-09-30T20:30:44Z",
++                  "is_current": true,
++                  "data_origin": "REAL_FULL"
++                },
++                {
++                  "field_value": "Real Madrid",
++                  "source": "transfermarkt_dataset",
++                  "dataset_version": "sample_2026-07-06",
++                  "fetched_at": "2026-09-30T20:30:46Z",
++                  "is_current": true,
++                  "data_origin": "SAMPLE_FIXTURE"
++                }
++              ]
++            },
++            {
++              "field_name": "date_of_birth",
++              "values": [
++                {
++                  "field_value": "2000-07-12",
++                  "source": "ea_fc26",
++                  "dataset_version": "2025-09-19",
++                  "fetched_at": "2026-09-30T20:30:44Z",
++                  "is_current": true,
++                  "data_origin": "REAL_FULL"
++                },
++                {
++                  "field_value": "2000-07-12",
++                  "source": "transfermarkt_dataset",
++                  "dataset_version": "sample_2026-07-06",
++                  "fetched_at": "2026-09-30T20:30:46Z",
++                  "is_current": true,
++                  "data_origin": "SAMPLE_FIXTURE"
++                }
++              ]
++            },
++            {
++              "field_name": "display_name",
++              "values": [
++                {
++                  "field_value": "Vini Jr.",
++                  "source": "ea_fc26",
++                  "dataset_version": "2025-09-19",
++                  "fetched_at": "2026-09-30T20:30:44Z",
++                  "is_current": true,
++                  "data_origin": "REAL_FULL"
++                },
++                {
++                  "field_value": "Vinicius Junior",
++                  "source": "transfermarkt_dataset",
++                  "dataset_version": "sample_2026-07-06",
++                  "fetched_at": "2026-09-30T20:30:46Z",
++                  "is_current": true,
++                  "data_origin": "SAMPLE_FIXTURE"
++                }
++              ]
++            },
++            {
++              "field_name": "nationality",
++              "values": [
++                {
++                  "field_value": "Brazil",
++                  "source": "ea_fc26",
++                  "dataset_version": "2025-09-19",
++                  "fetched_at": "2026-09-30T20:30:44Z",
++                  "is_current": true,
++                  "data_origin": "REAL_FULL"
++                },
++                {
++                  "field_value": "Brazil",
++                  "source": "transfermarkt_dataset",
++                  "dataset_version": "sample_2026-07-06",
++                  "fetched_at": "2026-09-30T20:30:46Z",
++                  "is_current": true,
++                  "data_origin": "SAMPLE_FIXTURE"
++                }
++              ]
++            },
++            {
++              "field_name": "position",
++              "values": [
++                {
++                  "field_value": "LW",
++                  "source": "ea_fc26",
++                  "dataset_version": "2025-09-19",
++                  "fetched_at": "2026-09-30T20:30:44Z",
++                  "is_current": true,
++                  "data_origin": "REAL_FULL"
++                },
++                {
++                  "field_value": "Left Winger",
++                  "source": "transfermarkt_dataset",
++                  "dataset_version": "sample_2026-07-06",
++                  "fetched_at": "2026-09-30T20:30:46Z",
++                  "is_current": true,
++                  "data_origin": "SAMPLE_FIXTURE"
++                }
++              ]
++            }
++          ],
++          "meta": {
++            "contract_version": "0.2.0-draft",
++            "generated_at": "2026-09-30T20:30:00Z",
++            "contains_sample_data": true
++          }
++        }
++      },
++      "data_freshness_today": {
++        "summary": "Nothing is live; two of three sources are samples; no injury source; no model",
++        "value": {
++          "sources": [
++            {
++              "role": "PLAYER_ATTRIBUTES",
++              "source": "ea_fc26",
++              "availability": "AVAILABLE",
++              "data_origin": "REAL_FULL",
++              "dataset_version": "2025-09-19",
++              "last_fetched_at": "2026-09-30T20:30:44Z",
++              "record_count": 16107,
++              "is_live": false
++            },
++            {
++              "role": "MARKET_VALUE",
++              "source": "transfermarkt_dataset",
++              "availability": "AVAILABLE",
++              "data_origin": "SAMPLE_FIXTURE",
++              "dataset_version": "sample_2026-07-06",
++              "last_fetched_at": "2026-09-30T20:30:46Z",
++              "record_count": 5,
++              "is_live": false
++            },
++            {
++              "role": "ENRICHMENT",
++              "source": "wikidata",
++              "availability": "AVAILABLE",
++              "data_origin": "SAMPLE_FIXTURE",
++              "dataset_version": "fixture:922e74f46d64",
++              "last_fetched_at": "2026-09-30T20:30:47Z",
++              "record_count": 4,
++              "is_live": false
++            },
++            {
++              "role": "INJURY",
++              "source": null,
++              "availability": "NO_SOURCE_DATA",
++              "data_origin": null,
++              "dataset_version": null,
++              "last_fetched_at": null,
++              "record_count": null,
++              "is_live": false
++            },
++            {
++              "role": "MODEL",
++              "source": null,
++              "availability": "NOT_YET_INTEGRATED",
++              "data_origin": null,
++              "dataset_version": null,
++              "last_fetched_at": null,
++              "record_count": null,
++              "is_live": false
++            }
++          ],
++          "meta": {
++            "contract_version": "0.2.0-draft",
++            "generated_at": "2026-09-30T20:30:00Z",
++            "contains_sample_data": true
++          }
++        }
++      },
++      "health_ok": {
++        "summary": "healthy",
++        "value": {
++          "status": "ok",
++          "database_reachable": true,
++          "contract_version": "0.2.0-draft"
++        }
++      },
++      "problem_invalid_q": {
++        "summary": "q too short",
++        "value": {
++          "type": "about:blank",
++          "title": "Invalid parameter",
++          "status": 400,
++          "code": "INVALID_PARAMETER",
++          "detail": "One or more parameters are invalid.",
++          "instance": "/api/v1/players/search",
++          "errors": [
++            {
++              "parameter": "q",
++              "reason": "length must be between 2 and 80 after trimming"
++            }
++          ]
++        }
++      },
++      "problem_not_found": {
++        "summary": "Well-formed id, no such player",
++        "value": {
++          "type": "about:blank",
++          "title": "Player not found",
++          "status": 404,
++          "code": "PLAYER_NOT_FOUND",
++          "detail": "No player with id ea:1.",
++          "instance": "/api/v1/players/ea:1"
++        }
++      }
++    }
++  },
++  "servers": [
++    {
++      "url": "/api/v1",
++      "description": "planned base path"
++    }
++  ]
++}
+diff --git a/football_intel_backend_phase2/project/ingestion/loader.py b/football_intel_backend_phase2/project/ingestion/loader.py
+index dd8500b..a1bfa8b 100644
+--- a/football_intel_backend_phase2/project/ingestion/loader.py
++++ b/football_intel_backend_phase2/project/ingestion/loader.py
+@@ -54,12 +54,38 @@ def _bulk_insert(con: duckdb.DuckDBPyConnection, table: str, columns: list[str],
+         con.unregister("_bulk_insert_tmp")
+ 
+ 
++def _drop_already_loaded(con: duckdb.DuckDBPyConnection, fields: list[IdentityFieldValue]) -> list[IdentityFieldValue]:
++    """Idempotency guard (G9). A field is "already loaded" when player_field_values already holds a row with the
++    same logical key (source, source_record_id, field_name, field_value, dataset_version). Re-ingesting the same
++    dataset therefore adds nothing; a CHANGED value (same or new dataset_version) has a different key and is
++    appended as before, so the table stays append-only and nothing is ever deleted or edited.
++    Duplicates inside one batch are collapsed too. `fetched_at` and `is_current` are deliberately NOT part of the
++    key (fetched_at differs on every run; is_current is never a selection criterion)."""
++    if not fields:
++        return []
++    sources = sorted({f.source for f in fields})
++    marks = ", ".join("?" for _ in sources)
++    seen = set(con.execute(
++        f"select source, source_record_id, field_name, field_value, dataset_version from player_field_values where source in ({marks})",
++        sources,
++    ).fetchall())
++    fresh = []
++    for f in fields:
++        key = (f.source, f.source_record_id, f.field_name, f.field_value, f.dataset_version)
++        if key in seen:
++            continue
++        seen.add(key)
++        fresh.append(f)
++    return fresh
++
++
+ def load_identity_fields(con: duckdb.DuckDBPyConnection, fields: list[IdentityFieldValue]) -> int:
+-    """Append-only: every (source, source_record_id, field_name, fetched_at)
+-    combination gets its own row. Two sources disagreeing on a field
+-    (e.g. EA says nationality=Brazil, transfermarkt says Portugal) means
+-    TWO rows here, never one overwritten by the other. player_uid is left
+-    NULL until matching assigns one (see backfill_player_uid below)."""
++    """Append-only AND idempotent: a (source, source_record_id, field_name, field_value, dataset_version)
++    combination is stored once; re-running the same dataset adds no rows (see _drop_already_loaded). Two sources
++    disagreeing on a field (e.g. EA says nationality=Brazil, transfermarkt says Portugal) means TWO rows here,
++    never one overwritten by the other. player_uid is left NULL until matching assigns one (see
++    backfill_player_uid below). Returns the number of rows actually written."""
++    fields = _drop_already_loaded(con, fields)
+     if not fields:
+         return 0
+     next_id = _next_id(con, "player_field_values")
+@@ -357,9 +383,10 @@ def backfill_player_uid(con: duckdb.DuckDBPyConnection) -> dict[str, int]:
+ 
+ 
+ def load_identity_fields_for_player(con: duckdb.DuckDBPyConnection, player_uid: str, fields: list[IdentityFieldValue]) -> int:
+-    """Same append-only contract as load_identity_fields(), but for the
++    """Same append-only + idempotent contract as load_identity_fields(), but for the
+     enrichment path (wikidata) where player_uid is already known at
+     insert time — no need to wait for backfill_player_uid()."""
++    fields = _drop_already_loaded(con, fields)
+     if not fields:
+         return 0
+     next_id = _next_id(con, "player_field_values")
+diff --git a/football_intel_backend_phase2/project/ingestion/providers/wikidata.py b/football_intel_backend_phase2/project/ingestion/providers/wikidata.py
+index 838e592..213a4c4 100644
+--- a/football_intel_backend_phase2/project/ingestion/providers/wikidata.py
++++ b/football_intel_backend_phase2/project/ingestion/providers/wikidata.py
+@@ -19,6 +19,7 @@ later is a small, contained change.
+ """
+ from __future__ import annotations
+ 
++import hashlib
+ from dataclasses import dataclass
+ from datetime import datetime, timezone
+ from pathlib import Path
+@@ -75,11 +76,12 @@ class WikidataProvider(Provider):
+             )
+ 
+         fetched_at = datetime.now(timezone.utc)
+-        # Even fixture-sourced rows are tagged as if pulled live, since that's
+-        # the real provider's actual behaviour — 'live:' prefix distinguishes
+-        # this continuously-edited source from transfermarkt_dataset's frozen
+-        # snapshot dataset_version.
+-        dataset_version = f"live:{fetched_at.date().isoformat()}"
++        # The only reachable code path above reads a LOCAL FIXTURE, so rows are
++        # tagged 'fixture:<id>' - never 'live:'. <id> is a hash of the fixture's CONTENT, so the same
++        # fixture always has the same dataset_version (re-ingesting it is a no-op, G9) and a changed
++        # fixture gets a new one. A 'live:<date>' tag is reserved for a future code path that really
++        # queries the external endpoint.
++        dataset_version = "fixture:" + hashlib.sha256(self.fixture_path.read_bytes()).hexdigest()[:12]
+ 
+         df = pd.read_csv(self.fixture_path)
+         for _, row in df.iterrows():
+diff --git a/football_intel_backend_phase2/project/matching/loader.py b/football_intel_backend_phase2/project/matching/loader.py
+index 1eda4a6..d90bc6c 100644
+--- a/football_intel_backend_phase2/project/matching/loader.py
++++ b/football_intel_backend_phase2/project/matching/loader.py
+@@ -93,6 +93,61 @@ def persist_identity_matches(
+     return len(rows)
+ 
+ 
++def _candidate_signature(ea_id, tm_id, wd_id, status, confidence, matched_on, is_best) -> tuple:
++    return (
++        int(ea_id) if ea_id is not None else None,
++        int(tm_id) if tm_id is not None else None,
++        wd_id,
++        status,
++        round(float(confidence), 9) if confidence is not None else None,
++        matched_on or "",
++        bool(is_best),
++    )
++
++
++def drop_unchanged_match_results(con: duckdb.DuckDBPyConnection, results: list[MatchResult]) -> list[MatchResult]:
++    """Idempotency guard for identity_matches (G9). identity_matches stays an append-only audit trail of
++    DISTINCT outcomes: a result is skipped only when the latest stored group for the same EA id has an identical
++    candidate set (ids, status, confidence, matched_on, is_best). A changed outcome (new transfermarkt data,
++    changed thresholds, ...) is NOT skipped, so history is preserved and the newest group wins in read models
++    (latest by matched_at, then id). Results without an EA id are always kept. Nothing is deleted or edited.
++    persist_identity_matches() itself is unchanged: it remains the plain append primitive."""
++    if not results:
++        return []
++    rows = con.execute(
++        "select ea_fc26_id, transfermarkt_id, wikidata_id, match_status, match_confidence, matched_on, is_best, "
++        "match_group_id, matched_at, id from identity_matches where ea_fc26_id is not null"
++    ).fetchall()
++    groups: dict[str, dict] = {}
++    for ea_id, tm_id, wd_id, status, conf, on, best, gid, at, rid in rows:
++        g = groups.setdefault(gid, {"ea": ea_id, "order": (at, rid), "sig": []})
++        g["order"] = max(g["order"], (at, rid))
++        g["sig"].append(_candidate_signature(ea_id, tm_id, wd_id, status, conf, on, best))
++    latest: dict[int, tuple] = {}
++    for g in groups.values():
++        cur = latest.get(g["ea"])
++        if cur is None or g["order"] > cur[0]:
++            latest[g["ea"]] = (g["order"], tuple(sorted(g["sig"], key=repr)))
++
++    kept = []
++    for result in results:
++        candidates = result.all_candidates or ([result.best] if result.best else [])
++        if not candidates or candidates[0].ea_fc26_id is None:
++            kept.append(result)
++            continue
++        best_ids = (result.best.ea_fc26_id, result.best.transfermarkt_id, result.best.wikidata_id) if result.best else None
++        sig = tuple(sorted(
++            (_candidate_signature(c.ea_fc26_id, c.transfermarkt_id, c.wikidata_id, c.status, c.confidence,
++                                  ",".join(c.matched_on),
++                                  best_ids is not None and (c.ea_fc26_id, c.transfermarkt_id, c.wikidata_id) == best_ids)
++             for c in candidates), key=repr))
++        stored = latest.get(int(candidates[0].ea_fc26_id))
++        if stored is not None and stored[1] == sig:
++            continue
++        kept.append(result)
++    return kept
++
++
+ def create_player_records(
+     con: duckdb.DuckDBPyConnection,
+     results: list[MatchResult],
+diff --git a/football_intel_backend_phase2/project/requirements-dev.txt b/football_intel_backend_phase2/project/requirements-dev.txt
+new file mode 100644
+index 0000000..dcd3f2e
+--- /dev/null
++++ b/football_intel_backend_phase2/project/requirements-dev.txt
+@@ -0,0 +1,4 @@
++# Development / test-only dependencies. Production requirements stay in requirements.txt.
++-r requirements.txt
++# Needed by tests/test_contract/ (validates the OpenAPI examples against their schemas).
++jsonschema==4.26.0
+diff --git a/football_intel_backend_phase2/project/scripts/run_ingestion.py b/football_intel_backend_phase2/project/scripts/run_ingestion.py
+index 46b6d5b..8bd1946 100644
+--- a/football_intel_backend_phase2/project/scripts/run_ingestion.py
++++ b/football_intel_backend_phase2/project/scripts/run_ingestion.py
+@@ -49,7 +49,7 @@ from ingestion.providers.transfermarkt_dataset import TransfermarktDatasetProvid
+ from ingestion.providers.wikidata import WikidataProvider
+ from ingestion.validator import validate
+ from matching.identity import from_ea_record, from_transfermarkt_record, match_all
+-from matching.loader import create_player_records, persist_identity_matches
++from matching.loader import create_player_records, drop_unchanged_match_results, persist_identity_matches
+ from matching.review_persistence import persist_review_queue
+ from matching.wikidata_enrichment import enrich_players_with_wikidata
+ 
+@@ -327,7 +327,10 @@ def run_pipeline(config: PipelineConfig) -> IngestionReport:
+             for r in results:
+                 report.matching_counts[r.best.status] = report.matching_counts.get(r.best.status, 0) + 1
+ 
+-            persist_identity_matches(con, results)
++            changed = drop_unchanged_match_results(con, results)
++            n_written = persist_identity_matches(con, changed)
++            log.info("identity_matches: %d result(s) new/changed (%d rows appended), %d unchanged result(s) skipped (idempotent rerun)",
++                     len(changed), n_written, len(results) - len(changed))
+             create_player_records(con, results)
+             n_review = persist_review_queue(con, results)
+             log.info("review_queue: %d new pending item(s)", n_review)
+diff --git a/football_intel_backend_phase2/project/tests/test_contract/__init__.py b/football_intel_backend_phase2/project/tests/test_contract/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/football_intel_backend_phase2/project/tests/test_contract/test_architecture_doc.py b/football_intel_backend_phase2/project/tests/test_contract/test_architecture_doc.py
+new file mode 100644
+index 0000000..075ac49
+--- /dev/null
++++ b/football_intel_backend_phase2/project/tests/test_contract/test_architecture_doc.py
+@@ -0,0 +1,140 @@
++"""Step 3.3 - validates ARCHITECTURE_API.md against the contract and pins the facts its decisions rest on.
++Documentation tests only: no API exists and none is imported."""
++import ast
++import json
++import re
++import subprocess
++import sys
++import textwrap
++from pathlib import Path
++
++import duckdb
++import pytest
++
++from config.settings import PipelineConfig
++from scripts.run_ingestion import run_pipeline
++
++ROOT = Path(__file__).parents[2]
++DOC = (ROOT / "ARCHITECTURE_API.md").read_text(encoding="utf-8")
++SPEC = json.loads((ROOT / "api_contract" / "openapi.json").read_text(encoding="utf-8"))
++SMALL_EA = ROOT / "tests" / "fixtures" / "small_ea_fc26.csv"
++
++
++def test_required_sections_present():
++    for h in ["## 0. Scope", "## 2. Framework", "## 3. Layers", "## 4. Read-only", "## 5. SQL read models", "## 6. Search design",
++              "## 7. Service rules", "## 8. Error handling", "## 9. Configuration", "## 10. Test strategy", "## 11. Decisions on G1 and ML",
++              "## 12. API and frontend boundary", "## 14. Known gaps register", "## 15. Proposed next step"]:
++        assert h in DOC, h
++
++
++def test_doc_introduces_no_endpoint_outside_the_contract():
++    contract_paths = {re.sub(r"\{[^}]+\}", "*", p) for p in SPEC["paths"]}
++    for m in re.findall(r"`(/(?:players|health|data-freshness)[^`\s]*)`", DOC):
++        assert re.sub(r"\{[^}]+\}", "*", m) in contract_paths, m
++    assert "getAdmin" not in DOC and "/admin" in DOC          # admin is mentioned only as deferred
++    assert re.search(r"Out of scope.*`/admin/\*`", DOC.replace("\n", " "))
++
++
++def test_doc_states_the_non_negotiables():
++    for s in ["read_only=True", "EA_INGAME_VALUE", "NOT_YET_INTEGRATED", "ea:<id>", "is_live", "SAMPLE_FIXTURE", "fails closed",
++              "Build-then-swap", "contract wins", "no arithmetic between them"]:
++        assert s.lower() in DOC.lower(), s
++    assert "NOT installed" in DOC
++
++
++def test_gap_register_g1_to_g10():
++    rows = dict(re.findall(r"^\| (G\d+) \| ([A-Z]+(?: \([^)]*\))?) \|", DOC, re.M))
++    assert set(rows) == {f"G{i}" for i in range(1, 11)}
++    assert rows["G1"].startswith("OPEN") and rows["G2"] == "FIXED"
++    assert all(rows[f"G{i}"].startswith("KNOWN") for i in range(3, 9))
++    assert rows["G9"] == "FIXED" and rows["G10"] == "RESOLVED"
++
++
++def test_requirements_split():
++    dev = (ROOT / "requirements-dev.txt").read_text()
++    prod = (ROOT / "requirements.txt").read_text()
++    assert "jsonschema==" in dev and "-r requirements.txt" in dev
++    assert "jsonschema" not in prod                       # production requirements untouched
++    for fw in ("fastapi", "uvicorn", "pydantic", "flask"):
++        assert fw not in dev.lower() and fw not in prod.lower()   # nothing installed/declared for the API yet
++
++
++def test_g1_g8_state_unchanged_in_the_database(tmp_path):
++    """The decisions in section 11 assume today's state: raw_json NULL, ML columns NULL."""
++    cfg = PipelineConfig(db_path=tmp_path / "d.duckdb", ea_fc26_csv_path=SMALL_EA, report_dir=tmp_path / "r")
++    assert run_pipeline(cfg).success
++    c = duckdb.connect(str(cfg.db_path), read_only=True)
++    total, raw, pred, ver = c.execute(
++        "select count(*), count(raw_json), count(predicted_value_eur), count(model_version) from ea_fc26_attributes").fetchone()
++    assert (total, raw, pred, ver) == (50, 0, 0, 0)
++    c.close()
++
++
++def test_G9_fixed_rerun_into_same_db_adds_no_rows(tmp_path):
++    """G9 is FIXED (Step 3.4a): ingestion is idempotent. The authoritative invariant suite is tests/test_idempotency/;
++    this keeps ARCHITECTURE_API.md section 4 honest."""
++    cfg = PipelineConfig(db_path=tmp_path / "d.duckdb", ea_fc26_csv_path=SMALL_EA, report_dir=tmp_path / "r")
++    assert run_pipeline(cfg).success
++    c = duckdb.connect(str(cfg.db_path), read_only=True)
++    before = c.execute("select (select count(*) from player_field_values), (select count(*) from identity_matches)").fetchone()
++    c.close()
++    assert run_pipeline(cfg).success
++    c = duckdb.connect(str(cfg.db_path), read_only=True)
++    assert c.execute("select (select count(*) from player_field_values), (select count(*) from identity_matches)").fetchone() == before
++    assert c.execute("select count(*), count(distinct source_record_id) from player_field_values "
++                     "where source='ea_fc26' and field_name='display_name'").fetchone() == (50, 50)
++    c.close()
++
++
++def test_AD1_duckdb_single_writer_semantics(tmp_path):
++    """Pinned: many read-only processes are fine; a writer is locked out while a reader is open (basis of AD-2)."""
++    db = tmp_path / "t.duckdb"
++    con = duckdb.connect(str(db)); con.execute("create table t(a int)"); con.execute("insert into t values (1)"); con.close()
++    holder = subprocess.Popen([sys.executable, "-c", textwrap.dedent(f"""
++        import duckdb, time
++        c = duckdb.connect(r'{db}', read_only=True); print('ready', flush=True); time.sleep(8)""")],
++        stdout=subprocess.PIPE, text=True)
++    try:
++        assert holder.stdout.readline().strip() == "ready"
++        ro = subprocess.run([sys.executable, "-c", f"import duckdb;print(duckdb.connect(r'{db}', read_only=True).execute('select count(*) from t').fetchone()[0])"],
++                            capture_output=True, text=True)
++        assert ro.stdout.strip() == "1"
++        rw = subprocess.run([sys.executable, "-c", f"import duckdb;duckdb.connect(r'{db}')"], capture_output=True, text=True)
++        assert rw.returncode != 0 and "lock" in rw.stderr.lower()
++    finally:
++        holder.kill(); holder.wait()
++
++
++# ---- architecture fitness: applies the moment an api/ package exists --------------------------
++FORBIDDEN_ANYWHERE = {"ingestion", "matching", "scripts", "reporting", "pandas", "tensorflow", "keras", "catboost", "sklearn"}
++LAYER_RULES = {
++    "routers": {"duckdb", "api.repositories", "api.readmodels"},
++    "services": {"duckdb", "fastapi", "api.routers"},
++    "repositories": {"fastapi", "api.schemas", "api.services", "api.routers"},
++    "domain": {"duckdb", "fastapi", "pydantic", "api.schemas", "api.services", "api.repositories", "api.routers", "api.readmodels"},
++}
++
++
++def _imports(path):
++    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
++        if isinstance(node, ast.Import):
++            for a in node.names:
++                yield a.name
++        elif isinstance(node, ast.ImportFrom) and node.module:
++            yield node.module
++
++
++def test_api_package_respects_layer_boundaries_if_present():
++    api = ROOT / "api"
++    if not api.exists():
++        assert not list(ROOT.glob("api*.py"))              # nothing implemented yet (Step 3.3)
++        return
++    for f in api.rglob("*.py"):
++        layer = f.relative_to(api).parts[0]
++        for imp in _imports(f):
++            assert imp.split(".")[0] not in FORBIDDEN_ANYWHERE, f"{f}: {imp}"
++            for bad in LAYER_RULES.get(layer, set()):
++                assert not (imp == bad or imp.startswith(bad + ".")), f"{f}: layer {layer} imports {imp}"
++        if layer != "repositories" and layer != "readmodels":
++            src = f.read_text(encoding="utf-8").lower()
++            assert not re.search(r"\b(select|insert|update|delete)\b\s+[\w*(].*\b(from|into|set)\b", src), f"SQL outside repositories: {f}"
+diff --git a/football_intel_backend_phase2/project/tests/test_contract/test_endpoint_contract.py b/football_intel_backend_phase2/project/tests/test_contract/test_endpoint_contract.py
+new file mode 100644
+index 0000000..decd652
+--- /dev/null
++++ b/football_intel_backend_phase2/project/tests/test_contract/test_endpoint_contract.py
+@@ -0,0 +1,177 @@
++"""Step 3.2 - endpoint contract checks. Pure documentation tests: NO API exists; nothing here imports one."""
++import json
++import re
++from pathlib import Path
++
++import pytest
++
++CONTRACT = Path(__file__).parents[2] / "api_contract" / "openapi.json"
++
++EXPECTED_OPERATIONS = {
++    ("GET", "/health"): "getHealth",
++    ("GET", "/data-freshness"): "getDataFreshness",
++    ("GET", "/players/search"): "searchPlayers",
++    ("GET", "/players/{player_id}"): "getPlayer",
++    ("GET", "/players/{player_id}/market-value"): "getPlayerMarketValue",
++    ("GET", "/players/{player_id}/ea-attributes"): "getPlayerEaAttributes",
++    ("GET", "/players/{player_id}/injuries"): "getPlayerInjuries",
++    ("GET", "/players/{player_id}/lineage"): "getPlayerLineage",
++}
++
++
++@pytest.fixture(scope="module")
++def spec():
++    return json.loads(CONTRACT.read_text(encoding="utf-8"))
++
++
++def _refs(node):
++    if isinstance(node, dict):
++        for k, v in node.items():
++            if k == "$ref":
++                yield v
++            else:
++                yield from _refs(v)
++    elif isinstance(node, list):
++        for v in node:
++            yield from _refs(v)
++
++
++def _resolve(spec, ref):
++    assert ref.startswith("#/")
++    node = spec
++    for part in ref[2:].split("/"):
++        node = node[part]
++    return node
++
++
++def test_exact_endpoint_list_and_read_only(spec):
++    ops = {(m.upper(), path): o["operationId"] for path, item in spec["paths"].items() for m, o in item.items()}
++    assert ops == EXPECTED_OPERATIONS
++    assert all(m == "GET" for m, _ in ops)            # no write endpoints in this contract
++    assert not any("/admin" in p for _, p in ops)     # admin endpoints deferred (need an auth design)
++    assert len(set(ops.values())) == len(ops)
++
++
++def test_all_refs_resolve(spec):
++    for r in set(_refs(spec)):
++        _resolve(spec, r)
++
++
++def test_every_operation_has_200_and_problem_errors(spec):
++    for path, item in spec["paths"].items():
++        for o in item.values():
++            assert "200" in o["responses"]
++            assert o["x-status"] in ("IMPLEMENTABLE_TODAY", "SCHEMA_ONLY", "PLANNED")
++            for code, r in o["responses"].items():
++                if code != "200":
++                    resp = _resolve(spec, r["$ref"])
++                    assert "application/problem+json" in resp["content"]
++            if "{player_id}" in path:
++                assert {"400", "404", "503", "500"} <= set(o["responses"])
++
++
++def test_player_id_path_parameter_and_pattern(spec):
++    pat = re.compile(spec["components"]["schemas"]["PlayerId"]["pattern"])
++    assert pat.match("ea:209331") and pat.match("p:3943921e-6d70-4677-acb2-bceb4988cf07")
++    assert not pat.match("209331") and not pat.match("ea:") and not pat.match("x:1") and not pat.match("ea:1 OR 1=1")
++    for path, item in spec["paths"].items():
++        if "{player_id}" in path:
++            assert item["get"]["parameters"][0]["$ref"].endswith("PlayerIdPath")
++
++
++def test_search_parameters_have_bounds(spec):
++    params = {_resolve(spec, p["$ref"])["name"]: _resolve(spec, p["$ref"])
++              for p in spec["paths"]["/players/search"]["get"]["parameters"]}
++    assert set(params) == {"q", "entity_kind", "position", "nationality", "club", "min_overall", "sort", "limit", "offset"}
++    assert params["q"]["required"] is True and params["q"]["schema"]["minLength"] == 2
++    assert params["limit"]["schema"]["maximum"] == 50
++    assert params["offset"]["schema"]["maximum"] == 10000
++    assert params["sort"]["schema"]["enum"] == ["relevance", "overall_desc", "name_asc"]
++    # only filters the DB can actually serve (no height/age/pace/market-value filters)
++    assert "min_overall" in params and not {"min_pace", "age", "max_value"} & set(params)
++
++
++def test_planned_fields_are_nullable_or_availability_tagged(spec):
++    sch = spec["components"]["schemas"]
++    for name, s in sch.items():
++        for pname, p in s.get("properties", {}).items():
++            if p.get("x-status") == "PLANNED":
++                t = p.get("type")
++                assert (isinstance(t, list) and "null" in t), f"{name}.{pname} is PLANNED but not nullable"
++        if s.get("x-status") == "PLANNED":
++            assert "availability" in s["required"], f"{name} PLANNED block needs an availability"
++    # model block: explicit target, today always NOT_YET_INTEGRATED/null
++    ex = spec["components"]["examples"]
++    for e in ex.values():
++        for v in _find(e["value"], "model_estimate"):
++            assert v == {"availability": "NOT_YET_INTEGRATED", "target": "EA_INGAME_VALUE", "amount_eur": None, "model_version": None}
++    assert sch["ModelEstimate"]["properties"]["target"]["enum"] == ["EA_INGAME_VALUE"]
++
++
++def _find(node, key):
++    if isinstance(node, dict):
++        for k, v in node.items():
++            if k == key:
++                yield v
++            else:
++                yield from _find(v, key)
++    elif isinstance(node, list):
++        for v in node:
++            yield from _find(v, key)
++
++
++def test_examples_validate_against_schemas(spec):
++    import jsonschema  # hard requirement (requirements-dev.txt): this test must never be skipped
++    # map each example to the schema of the response it is attached to
++    attached = {}
++    for path, item in spec["paths"].items():
++        for o in item.values():
++            mt = o["responses"]["200"]["content"]["application/json"]
++            for name in mt.get("examples", {}):
++                attached[name] = mt["schema"]["$ref"].split("/")[-1]
++    attached["problem_invalid_q"] = attached["problem_not_found"] = "Problem"
++    assert set(attached) == set(spec["components"]["examples"])
++    for name, schema in attached.items():
++        wrapper = {"$ref": f"#/components/schemas/{schema}", "components": spec["components"]}
++        jsonschema.Draft202012Validator(wrapper).validate(spec["components"]["examples"][name]["value"])
++
++
++def test_example_honesty_invariants(spec):
++    ex = {k: v["value"] for k, v in spec["components"]["examples"].items()}
++    text = json.dumps(ex)
++    assert '"live:' not in text and "player_face_url" not in text and "sofifa" not in text.lower()
++    for key in ("profile_ea_only_salah", "profile_ea_only_ambiguous"):
++        p = ex[key]
++        assert p["identity"]["entity_kind"] == "EA_ONLY" and p["identity"]["canonical_player_uid"] is None
++        assert p["identity"]["source_ids"]["transfermarkt_id"] is None and p["identity"]["source_ids"]["wikidata_id"] is None
++        assert p["values"]["source_market_value"] == {"availability": "NOT_MATCHED", "amount_eur": None, "valuation_date": None, "provenance": None}
++        assert p["injury"]["status"] == "NOT_EVALUATED" and p["image"] is None
++        assert p["identity"]["links"]["wikidata"]["status"] == "NOT_EVALUATED"
++        assert [x["source"] for x in p["provenance"]] == ["ea_fc26"]
++    amb = ex["profile_ea_only_ambiguous"]["identity"]["links"]["transfermarkt"]
++    assert amb["status"] == "AMBIGUOUS" and amb["review_pending"] is True and amb["confidence"] is None and amb["matched_on"] is None
++    hl = ex["profile_canonical_haaland"]
++    assert hl["id"] == "ea:239085" and hl["identity"]["entity_kind"] == "CANONICAL"
++    assert hl["values"]["source_market_value"]["provenance"]["data_origin"] == "SAMPLE_FIXTURE"
++    assert hl["meta"]["contains_sample_data"] is True
++    assert hl["image"]["source"] == "wikidata"
++    assert hl["injury"]["status"] == "NO_SOURCE_AVAILABLE"      # 'no source', never 'no injuries'
++    assert ex["market_value_ea_only"]["points"] == [] and ex["market_value_ea_only"]["availability"] == "NOT_MATCHED"
++    pts = ex["market_value_haaland"]["points"]
++    assert [p["valuation_date"] for p in pts] == sorted(p["valuation_date"] for p in pts)
++    assert ex["market_value_haaland"]["latest"] == pts[-1]
++    assert ex["ea_attributes_salah"]["detailed_attributes"] == {"availability": "NOT_YET_INTEGRATED", "attributes": None}
++    assert all(s["is_live"] is False for s in ex["data_freshness_today"]["sources"])
++    roles = {s["role"]: s for s in ex["data_freshness_today"]["sources"]}
++    assert roles["INJURY"]["availability"] == "NO_SOURCE_DATA" and roles["MODEL"]["availability"] == "NOT_YET_INTEGRATED"
++    assert roles["ENRICHMENT"]["data_origin"] == "SAMPLE_FIXTURE" and roles["ENRICHMENT"]["dataset_version"].startswith("fixture:")
++    lin = {f["field_name"]: f for f in ex["lineage_vini"]["fields"]}
++    assert {v["source"] for v in lin["display_name"]["values"]} == {"ea_fc26", "transfermarkt_dataset"}  # conflict kept, not merged
++    assert ex["injuries_canonical"]["records"] == [] and ex["injuries_ea_only"]["records"] == []
++
++
++def test_no_endpoint_exposes_non_wikidata_images_or_internal_details(spec):
++    sch = spec["components"]["schemas"]
++    assert sch["PlayerImage"]["properties"]["source"]["enum"] == ["wikidata"]
++    names = {p for s in sch.values() for p in s.get("properties", {})}
++    assert not names & {"sql", "stack", "traceback", "db_path", "player_face_url", "raw_json", "candidates"}
+diff --git a/football_intel_backend_phase2/project/tests/test_contract/test_identity_contract.py b/football_intel_backend_phase2/project/tests/test_contract/test_identity_contract.py
+new file mode 100644
+index 0000000..4b63f51
+--- /dev/null
++++ b/football_intel_backend_phase2/project/tests/test_contract/test_identity_contract.py
+@@ -0,0 +1,195 @@
++"""Step 3.1 - identity/provenance contract checked against the REAL schema and a real
++(fixture-sized) pipeline run. The contract is a document; this test stops it from
++drifting from the database, and pins today's known gaps so that fixing one forces a
++contract update instead of silently diverging."""
++import json
++import re
++from pathlib import Path
++
++import duckdb
++import pytest
++
++from config.settings import PipelineConfig
++from scripts.run_ingestion import run_pipeline
++
++ROOT = Path(__file__).parents[2]
++CONTRACT = ROOT / "api_contract" / "openapi.json"
++SMALL_EA_CSV = ROOT / "tests" / "fixtures" / "small_ea_fc26.csv"
++TM_SAMPLE_DIR = ROOT / "data" / "raw" / "transfermarkt_dataset" / "sample_2026-07-06"
++MIGRATIONS = ROOT / "db" / "migrations"
++
++FORBIDDEN_PROPERTY_NAMES = {"value", "value_eur", "market_value", "predicted_value", "price"}
++
++
++@pytest.fixture(scope="module")
++def contract():
++    return json.loads(CONTRACT.read_text(encoding="utf-8"))
++
++
++@pytest.fixture(scope="module")
++def con(tmp_path_factory):
++    d = tmp_path_factory.mktemp("contract")
++    cfg = PipelineConfig(db_path=d / "c.duckdb", ea_fc26_csv_path=SMALL_EA_CSV,
++                         transfermarkt_dump_dir=TM_SAMPLE_DIR, report_dir=d / "r")
++    assert run_pipeline(cfg).success
++    c = duckdb.connect(str(cfg.db_path), read_only=True)
++    yield c
++    c.close()
++
++
++@pytest.fixture(scope="module")
++def con_full(tmp_path_factory):
++    """Full real 16,107-player EA run (~5s) - needed for the real AMBIGUOUS case and real counts."""
++    d = tmp_path_factory.mktemp("contract_full")
++    cfg = PipelineConfig(db_path=d / "f.duckdb", transfermarkt_dump_dir=TM_SAMPLE_DIR, report_dir=d / "r")
++    assert run_pipeline(cfg).success
++    c = duckdb.connect(str(cfg.db_path), read_only=True)
++    yield c
++    c.close()
++
++
++def _walk_props(schemas):
++    for sname, s in schemas.items():
++        stack = [s]
++        while stack:
++            node = stack.pop()
++            if isinstance(node, dict):
++                for pname, p in node.get("properties", {}).items():
++                    yield sname, pname, p
++                stack.extend(v for v in node.values() if isinstance(v, (dict, list)))
++            elif isinstance(node, list):
++                stack.extend(node)
++
++
++def _check_enum(migration_glob, table_hint):
++    text = "".join(p.read_text() for p in sorted(MIGRATIONS.glob(migration_glob)))
++    m = re.search(table_hint + r".*?IN \(([^)]*)\)", text, re.S)
++    return [x.strip().strip("'") for x in m.group(1).split(",")]
++
++
++def test_contract_version_is_draft(contract):
++    assert contract["info"]["version"].endswith("-draft")
++
++
++def test_no_generic_value_property(contract):
++    names = {p for _, p, _ in _walk_props(contract["components"]["schemas"])}
++    assert not (names & FORBIDDEN_PROPERTY_NAMES)
++    vals = contract["components"]["schemas"]["Values"]["properties"]
++    assert set(vals) == {"ea_ingame_value", "source_market_value", "model_estimate"}
++
++
++def test_every_leaf_property_declares_source_or_derivation(contract):
++    """Leaf properties (no $ref / object / array-of-refs / oneOf) must say where they come from."""
++    missing = []
++    for s_, n, p in _walk_props(contract["components"]["schemas"]):
++        structural = ("$ref" in p or "oneOf" in p or p.get("type") == "object"
++                      or (p.get("type") == "array" and "$ref" in p.get("items", {})))
++        if not structural and "x-source" not in p and "x-derived" not in p:
++            missing.append(f"{s_}.{n}")
++    assert missing == []
++
++
++def test_x_source_columns_exist_in_migrated_schema(contract, con):
++    cols = {(t, c) for t, c in con.execute(
++        "select table_name, column_name from information_schema.columns").fetchall()}
++    bad = []
++    for s, n, p in _walk_props(contract["components"]["schemas"]):
++        xs = p.get("x-source")
++        if not xs:
++            continue
++        if "column" in xs and (xs["table"], xs["column"]) not in cols:
++            bad.append(f"{s}.{n} -> {xs['table']}.{xs['column']}")
++        if "field_name" in xs:
++            n_rows = con.execute(
++                "select count(*) from player_field_values where field_name=? and source=?",
++                [xs["field_name"], xs["source"]]).fetchone()[0]
++            if n_rows == 0:
++                bad.append(f"{s}.{n} -> no player_field_values({xs['field_name']},{xs['source']}) rows")
++    assert bad == []
++
++
++def test_enums_match_database_check_constraints(contract):
++    sch = contract["components"]["schemas"]
++    assert sch["MatchStatus"]["enum"][:4] == _check_enum("0001_init.sql", r"match_status\s+VARCHAR NOT NULL CHECK")
++    assert sch["InjuryStatus"]["enum"][:3] == _check_enum("0001_init.sql", r"status\s+VARCHAR NOT NULL CHECK")
++    assert set(sch["MatchStatus"]["enum"]) - set(sch["MatchStatus"]["enum"][:4]) == {"NOT_EVALUATED"}
++    assert set(sch["InjuryStatus"]["enum"]) - set(sch["InjuryStatus"]["enum"][:3]) == {"NOT_EVALUATED"}
++
++
++def test_every_ea_player_is_servable_without_a_canonical_row(con):
++    """Decision D1: all EA players are addressable; core fields come from
++    player_field_values(source=ea_fc26) keyed by source_record_id == ea_fc26_id."""
++    ea_ids = {r[0] for r in con.execute("select ea_fc26_id from ea_fc26_attributes").fetchall()}
++    assert len(ea_ids) == 50
++    for field in ("display_name", "position", "club", "nationality", "date_of_birth"):
++        rows = con.execute(
++            "select source_record_id, count(*) from player_field_values "
++            "where source='ea_fc26' and field_name=? group by 1", [field]).fetchall()
++        assert {int(r[0]) for r in rows} == ea_ids, field
++        assert all(r[1] == 1 for r in rows), f"{field}: duplicate rows would duplicate API entities"
++
++
++def test_ea_only_players_have_no_inferred_identity(con):
++    ea_only = {r[0] for r in con.execute(
++        "select ea_fc26_id from ea_fc26_attributes where player_uid is null").fetchall()}
++    canonical = {r[0] for r in con.execute("select ea_fc26_id from v_players").fetchall()}
++    assert len(ea_only) == 45 and len(canonical) == 5 and not (ea_only & canonical)
++    # no TM/Wikidata/injury/image/market-value row may hang off an EA-only player
++    for tbl in ("market_value_history", "injury_data_status", "player_images"):
++        n = con.execute(f"select count(*) from {tbl} where player_uid is not null and player_uid not in "
++                        "(select player_uid from v_players)").fetchone()[0]
++        assert n == 0, tbl
++    n = con.execute("select count(*) from injury_data_status").fetchone()[0]
++    assert n == 5  # -> EA_ONLY players get InjuryStatus NOT_EVALUATED, derived by absence
++
++
++def test_ambiguous_candidate_ids_exist_but_must_not_be_exposed(con_full):
++    con = con_full
++    row = con.execute(
++        "select m.ea_fc26_id, m.transfermarkt_id from identity_matches m "
++        "where m.is_best and m.match_status='AMBIGUOUS'").fetchall()
++    assert row, "full real run contains the real AMBIGUOUS case (EA 233097)"
++    for ea_id, tm_id in row:
++        assert tm_id is not None  # the DB knows a candidate...
++        linked = con.execute("select count(*) from v_players where ea_fc26_id=?", [ea_id]).fetchone()[0]
++        assert linked == 0        # ...but the player is EA_ONLY, so SourceIds.transfermarkt_id must be null
++
++
++def test_images_are_wikidata_only(con):
++    srcs = {r[0] for r in con.execute("select distinct source from player_images").fetchall()}
++    assert srcs <= {"wikidata"}
++
++
++def test_not_evaluated_is_needed_for_wikidata_link_state(con):
++    """Enrichment iterates canonical players only: EA-only players were never compared to Wikidata."""
++    n = con.execute("select count(*) from identity_matches where wikidata_id is not null "
++                    "and ea_fc26_id in (select ea_fc26_id from ea_fc26_attributes where player_uid is null)").fetchone()[0]
++    assert n == 0
++
++
++# ---- known gaps, pinned so a fix forces a contract update ----------------
++
++def test_known_gap_G1_raw_json_is_never_populated(con):
++    """G1: ea_fc26_attributes.raw_json is NULL for every row, so detailed EA attributes
++    (pace, finishing...) are NOT available from the DB. Step 3.2 must either scope the
++    API to overall/potential/value, or a separate backend step must populate it."""
++    total, filled = con.execute("select count(*), count(raw_json) from ea_fc26_attributes").fetchone()
++    assert total == 50 and filled == 0
++
++
++def test_G2_fixed_wikidata_fixture_is_tagged_fixture_not_live(con):
++    """G2 (fixed in Step 3.2 prelude): fixture reads are stamped 'fixture:<date>'. The contract still derives
++    data_origin from a source registry, but no 'live:' label may come from a fixture run."""
++    v = con.execute("select distinct dataset_version from player_field_values where source='wikidata'").fetchall()
++    assert v and all(x[0].startswith("fixture:") for x in v)
++
++
++def test_full_scale_ea_universe_is_exposable(con_full):
++    """Decision D1 at real scale: 16,107 EA players, 5 canonical, 16,102 EA-only."""
++    total, only = con_full.execute(
++        "select count(*), count(*) filter (where player_uid is null) from ea_fc26_attributes").fetchone()
++    assert (total, only) == (16107, 16102)
++    dup_names = con_full.execute(
++        "select count(*) from (select lower(field_value) n from player_field_values "
++        "where source='ea_fc26' and field_name='display_name' group by 1 having count(*)>1)").fetchone()[0]
++    assert dup_names == 124  # names are NOT identifiers; search results must disambiguate
+diff --git a/football_intel_backend_phase2/project/tests/test_contract/test_search_spec.py b/football_intel_backend_phase2/project/tests/test_contract/test_search_spec.py
+new file mode 100644
+index 0000000..6a187a3
+--- /dev/null
++++ b/football_intel_backend_phase2/project/tests/test_contract/test_search_spec.py
+@@ -0,0 +1,101 @@
++"""Executable SPEC for ARCHITECTURE_API.md section 6 (search normalization / match quality).
++The reference functions below live in the TEST only; the future api/domain implementation must satisfy the same cases.
++No API code exists."""
++import collections
++import unicodedata
++from pathlib import Path
++
++import pandas as pd
++import pytest
++
++EA_CSV = Path(__file__).parents[2] / "data" / "raw" / "ea_fc26" / "fc26_merged_clean.csv"
++FOLD = {"ø": "o", "ł": "l", "ı": "i", "æ": "ae", "œ": "oe", "ð": "d", "þ": "th", "đ": "d", "ħ": "h"}
++
++
++def normalize(s: str) -> str:
++    s = unicodedata.normalize("NFKD", s).casefold()
++    out = []
++    for ch in s:
++        cat = unicodedata.category(ch)
++        if cat == "Mn" or cat == "Cf":
++            continue                                   # combining marks / soft hyphen: deleted
++        ch = FOLD.get(ch, ch)
++        out.append(" " if cat[0] in "PSZC" else ch)   # punctuation, symbols, separators, controls -> space
++    return " ".join("".join(out).split())
++
++
++QUALITY = ["EXACT", "PREFIX", "TOKEN_PREFIX", "SUBSTRING"]
++
++
++def quality(name: str, q: str):
++    n, q = normalize(name), normalize(q)
++    if n == q:
++        return "EXACT"
++    if n.startswith(q):
++        return "PREFIX"
++    nt = n.split()
++    used = set()
++    ok = True
++    for t in q.split():
++        hit = next((i for i, x in enumerate(nt) if i not in used and x.startswith(t)), None)
++        if hit is None:
++            ok = False
++            break
++        used.add(hit)
++    if ok:
++        return "TOKEN_PREFIX"
++    return "SUBSTRING" if q in n else None
++
++
++@pytest.mark.parametrize("raw,expected", [
++    ("Martin Ødegaard", "martin odegaard"),
++    ("Dagur Dan Þór\u00adhalls\u00adson", "dagur dan thorhallsson"),   # soft hyphen deleted, thorn folded
++    ("N'Golo Kanté", "n golo kante"),
++    ("Vini Jr.", "vini jr"),
++    ("Pierre-Emile Højbjerg", "pierre emile hojbjerg"),
++    ("Pascal Groß", "pascal gross"),
++    ("  Łukasz   Fabiański ", "lukasz fabianski"),
++])
++def test_normalization_golden(raw, expected):
++    assert normalize(raw) == expected
++
++
++@pytest.mark.parametrize("name,q,expected", [
++    ("Vini Jr.", "vini jr", "EXACT"),
++    ("Vini Jr.", "vini", "PREFIX"),
++    ("Vini Jr.", "jr vini", "TOKEN_PREFIX"),
++    ("Rick van Drongelen", "dron", "TOKEN_PREFIX"),
++    ("Rick van Drongelen", "ngel", "SUBSTRING"),
++    ("Erling Haaland", "xyz", None),
++    ("Al Al", "al al al", None),                      # a name token is used at most once
++])
++def test_match_quality_golden(name, q, expected):
++    assert quality(name, q) == expected
++
++
++def test_quality_order_is_the_contract_order():
++    assert QUALITY == ["EXACT", "PREFIX", "TOKEN_PREFIX", "SUBSTRING"]
++
++
++@pytest.fixture(scope="module")
++def names():
++    return pd.read_csv(EA_CSV, low_memory=False)["player_name"].astype(str).tolist()
++
++
++def test_real_data_nfkd_alone_is_insufficient_and_spec_is_sufficient(names):
++    def nfkd_only(s):
++        return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
++    assert len(names) == 16107
++    assert sum(1 for n in names if not nfkd_only(n).isascii()) == 314   # figure quoted in ARCHITECTURE_API.md
++    normalized = [normalize(n) for n in names]
++    assert all(n and n.isascii() for n in normalized)                    # 0 residual, none empty
++
++
++def test_real_data_duplicate_names_are_not_identifiers(names):
++    assert sum(1 for v in collections.Counter(n.casefold() for n in names).values() if v > 1) == 124
++    assert sum(1 for v in collections.Counter(normalize(n) for n in names).values() if v > 1) == 128
++
++
++def test_ordering_is_total_when_ea_id_is_the_last_key():
++    rows = [(0, -80, 2), (0, -80, 1), (1, -90, 3)]     # (quality rank, -overall, ea_id)
++    assert sorted(rows) == [(0, -80, 1), (0, -80, 2), (1, -90, 3)]
+diff --git a/football_intel_backend_phase2/project/tests/test_idempotency/__init__.py b/football_intel_backend_phase2/project/tests/test_idempotency/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/football_intel_backend_phase2/project/tests/test_idempotency/test_g9_rerun_invariants.py b/football_intel_backend_phase2/project/tests/test_idempotency/test_g9_rerun_invariants.py
+new file mode 100644
+index 0000000..535819f
+--- /dev/null
++++ b/football_intel_backend_phase2/project/tests/test_idempotency/test_g9_rerun_invariants.py
+@@ -0,0 +1,191 @@
++"""G9 - ingestion idempotency invariants (written BEFORE the fix; they fail on the pre-fix code).
++
++Rules under test (owner-approved):
++  R1 re-running the SAME dataset into the SAME db creates no new rows in ANY table.
++  R2 source tables stay append-only: a CHANGED value (same or new dataset_version) is appended, nothing is deleted.
++  R3 `is_current` alone is never the selection criterion; the read-model rule is deterministic:
++     latest row per logical key by (fetched_at DESC, id DESC).
++  R4 no migration/schema change is needed (asserted: migrations dir unchanged = 6 files).
++"""
++import shutil
++from datetime import datetime, timezone
++from pathlib import Path
++
++import duckdb
++import pandas as pd
++import pytest
++
++from config.settings import PipelineConfig
++from scripts.run_ingestion import run_pipeline
++
++ROOT = Path(__file__).parents[2]
++SMALL_EA = ROOT / "tests" / "fixtures" / "small_ea_fc26.csv"
++TM_SAMPLE = ROOT / "data" / "raw" / "transfermarkt_dataset" / "sample_2026-07-06"
++TABLES = ["players", "player_field_values", "ea_fc26_attributes", "market_value_history", "transfers", "appearances",
++          "injury_data_status", "identity_matches", "review_queue", "player_images", "player_wikidata_links"]
++
++# The ONE read-model selection rule (executable spec; ARCHITECTURE_API.md section 4).
++LATEST_FIELD_VALUES_SQL = """
++select source, source_record_id, field_name, field_value, dataset_version, fetched_at, id from (
++  select *, row_number() over (partition by source, source_record_id, field_name order by fetched_at desc, id desc) rn
++  from player_field_values) where rn = 1
++"""
++LATEST_BEST_MATCH_SQL = """
++select ea_fc26_id, transfermarkt_id, match_status, match_confidence, matched_on from (
++  select *, row_number() over (partition by ea_fc26_id order by matched_at desc, id desc) rn
++  from identity_matches where is_best and ea_fc26_id is not null) where rn = 1
++"""
++
++
++def _cfg(tmp, name="g9.duckdb", ea=SMALL_EA, tm=TM_SAMPLE):
++    return PipelineConfig(db_path=tmp / name, ea_fc26_csv_path=ea, transfermarkt_dump_dir=tm, report_dir=tmp / "r")
++
++
++def _counts(path):
++    c = duckdb.connect(str(path), read_only=True)
++    try:
++        return {t: c.execute(f"select count(*) from {t}").fetchone()[0] for t in TABLES}
++    finally:
++        c.close()
++
++
++def _q(path, sql):
++    c = duckdb.connect(str(path), read_only=True)
++    try:
++        return c.execute(sql).fetchall()
++    finally:
++        c.close()
++
++
++# ---------------- R1: same dataset, same DB, no new rows --------------------------------------
++def test_R1_second_and_third_run_add_no_rows_to_any_table(tmp_path):
++    cfg = _cfg(tmp_path)
++    assert run_pipeline(cfg).success
++    first = _counts(cfg.db_path)
++    assert first["player_field_values"] > 0 and first["identity_matches"] > 0       # the test is not vacuous
++    for _ in range(2):
++        assert run_pipeline(cfg).success
++        assert _counts(cfg.db_path) == first
++
++
++def test_R1_logical_keys_are_unique_after_reruns(tmp_path):
++    cfg = _cfg(tmp_path)
++    for _ in range(3):
++        assert run_pipeline(cfg).success
++    dup_fields = _q(cfg.db_path, "select count(*) from (select 1 from player_field_values "
++                    "group by source, source_record_id, field_name, field_value, dataset_version having count(*) > 1)")[0][0]
++    assert dup_fields == 0
++    # one EA display_name row per EA player
++    assert _q(cfg.db_path, "select count(*), count(distinct source_record_id) from player_field_values "
++              "where source='ea_fc26' and field_name='display_name'")[0] == (50, 50)
++    # exactly one best-match row per EA id after identical reruns
++    assert _q(cfg.db_path, "select count(*) from (select 1 from identity_matches where is_best and ea_fc26_id is not null "
++              "group by ea_fc26_id having count(*) > 1)")[0][0] == 0
++
++
++def test_R1_rerun_database_is_logically_identical_to_single_run(tmp_path):
++    once, twice = _cfg(tmp_path, "once.duckdb"), _cfg(tmp_path, "twice.duckdb")
++    run_pipeline(once); run_pipeline(twice); run_pipeline(twice)
++    for sql in (LATEST_FIELD_VALUES_SQL.replace("fetched_at, id", "dataset_version").replace("source, source_record_id, field_name, field_value, dataset_version, dataset_version", "source, source_record_id, field_name, field_value, dataset_version") + " order by 1,2,3",
++                LATEST_BEST_MATCH_SQL + " order by 1"):
++        assert sorted(map(str, _q(once.db_path, sql))) == sorted(map(str, _q(twice.db_path, sql)))
++
++
++def test_R1_wikidata_fixture_rerun_on_a_different_day_adds_no_rows(tmp_path, monkeypatch):
++    """The fixture's dataset_version must identify its CONTENT, not the run date."""
++    import ingestion.providers.wikidata as wd
++    cfg = _cfg(tmp_path)
++
++    class Day1(datetime):
++        @classmethod
++        def now(cls, tz=None): return datetime(2026, 10, 1, 9, 0, tzinfo=timezone.utc)
++
++    class Day2(datetime):
++        @classmethod
++        def now(cls, tz=None): return datetime(2026, 10, 2, 9, 0, tzinfo=timezone.utc)
++
++    monkeypatch.setattr(wd, "datetime", Day1); assert run_pipeline(cfg).success
++    first = _counts(cfg.db_path)
++    monkeypatch.setattr(wd, "datetime", Day2); assert run_pipeline(cfg).success
++    assert _counts(cfg.db_path) == first
++    versions = {r[0] for r in _q(cfg.db_path, "select distinct dataset_version from player_field_values where source='wikidata'")}
++    assert len(versions) == 1 and next(iter(versions)).startswith("fixture:")      # still never 'live:'
++
++
++# ---------------- R2: changes are appended, nothing deleted ------------------------------------
++def _modified_ea_csv(tmp_path, club="Test FC"):
++    df = pd.read_csv(SMALL_EA)
++    club_col = "team"          # ingestion/normalizer.py maps EA payload key 'team' -> field 'club'
++    df.loc[df.index[0], club_col] = club
++    p = tmp_path / "ea_modified.csv"; df.to_csv(p, index=False)
++    return p, df.iloc[0], club_col
++
++
++def test_R2_changed_value_same_dataset_version_is_appended_and_latest_wins(tmp_path):
++    cfg = _cfg(tmp_path)
++    assert run_pipeline(cfg).success
++    before = _counts(cfg.db_path)
++    mod, row, _ = _modified_ea_csv(tmp_path)
++    cfg2 = _cfg(tmp_path, ea=mod); assert run_pipeline(cfg2).success
++    after = _counts(cfg.db_path)
++    assert after["player_field_values"] == before["player_field_values"] + 1       # exactly the changed field, appended
++    ea_id = str(int(row["id"]))
++    rows = _q(cfg.db_path, f"select field_value from player_field_values where source='ea_fc26' and source_record_id='{ea_id}' and field_name='club' order by fetched_at, id")
++    assert len(rows) == 2 and rows[-1][0] == "Test FC"                              # old row kept (append-only)
++    latest = _q(cfg.db_path, f"select field_value from ({LATEST_FIELD_VALUES_SQL}) where source='ea_fc26' and source_record_id='{ea_id}' and field_name='club'")
++    assert latest == [("Test FC",)]                                                  # deterministic latest-wins
++
++
++def test_R3_is_current_is_not_the_selection_criterion(tmp_path):
++    cfg = _cfg(tmp_path)
++    run_pipeline(cfg)
++    mod, row, _ = _modified_ea_csv(tmp_path); run_pipeline(_cfg(tmp_path, ea=mod))
++    # both the superseded and the new row are flagged current -> is_current cannot pick the valid one
++    cur = _q(cfg.db_path, "select count(*) from (select 1 from player_field_values where is_current group by source, source_record_id, field_name having count(*) > 1)")[0][0]
++    assert cur == 1
++    # the read-model rule still yields exactly one row per logical key
++    n_keys = _q(cfg.db_path, "select count(*) from (select 1 from player_field_values group by source, source_record_id, field_name)")[0][0]
++    assert _q(cfg.db_path, f"select count(*) from ({LATEST_FIELD_VALUES_SQL})")[0][0] == n_keys
++
++
++def test_R2_changed_match_outcome_appends_a_new_group_and_latest_group_wins(tmp_path):
++    """Same EA data but a different transfermarkt dataset version/content => matching is a NEW result: history kept."""
++    cfg = _cfg(tmp_path)
++    assert run_pipeline(cfg).success
++    base = _counts(cfg.db_path)["identity_matches"]
++    tm2 = tmp_path / "tm2"; shutil.copytree(TM_SAMPLE, tm2)
++    players = tm2 / "players.csv"
++    df = pd.read_csv(players)
++    df.loc[df.index[0], "name"] = "Zzz Changed Name"; df.to_csv(players, index=False)
++    cfg2 = _cfg(tmp_path, tm=tm2); cfg2.db_path = cfg.db_path
++    assert run_pipeline(cfg2).success
++    c = _counts(cfg.db_path)["identity_matches"]
++    assert c > base                                                                  # new outcome appended, old rows kept
++    assert _q(cfg.db_path, f"select count(*) from ({LATEST_BEST_MATCH_SQL})")[0][0] == 50   # still one per EA id
++
++
++# ---------------- R4: no migration needed -------------------------------------------------------
++def test_R4_no_new_migration_for_g9():
++    assert len(list((ROOT / "db" / "migrations").glob("*.sql"))) == 6
++
++
++# ---------------- legacy databases (built before the fix) -----------------------------------------
++def test_R5_legacy_duplicates_are_not_deleted_not_grown_and_read_model_collapses_them(tmp_path):
++    """A DB that already holds pre-fix duplicates: a rerun adds nothing, deletes nothing; the read-model rule
++    still yields exactly one row per logical key, and the choice is deterministic."""
++    cfg = _cfg(tmp_path)
++    assert run_pipeline(cfg).success
++    c = duckdb.connect(str(cfg.db_path))
++    nid = c.execute("select max(id) from player_field_values").fetchone()[0]
++    # simulate the old behaviour: a full second copy of the EA field rows, with a later fetched_at
++    c.execute(f"insert into player_field_values select id + {nid}, player_uid, field_name, field_value, source, source_record_id, "
++              "fetched_at + interval 1 hour, dataset_version, is_current, confidence from player_field_values where source = 'ea_fc26'")
++    c.close()
++    legacy = _counts(cfg.db_path)
++    assert legacy["player_field_values"] > 337
++    assert run_pipeline(cfg).success
++    assert _counts(cfg.db_path) == legacy                                              # no growth, no deletion
++    n_keys = _q(cfg.db_path, "select count(*) from (select 1 from player_field_values group by source, source_record_id, field_name)")[0][0]
++    assert _q(cfg.db_path, f"select count(*) from ({LATEST_FIELD_VALUES_SQL})")[0][0] == n_keys
++    first = _q(cfg.db_path, f"select * from ({LATEST_FIELD_VALUES_SQL}) order by 1,2,3")
++    assert first == _q(cfg.db_path, f"select * from ({LATEST_FIELD_VALUES_SQL}) order by 1,2,3")   # deterministic
+diff --git a/football_intel_backend_phase2/project/tests/test_pipeline/test_run_ingestion.py b/football_intel_backend_phase2/project/tests/test_pipeline/test_run_ingestion.py
+index 7954b35..3bce361 100644
+--- a/football_intel_backend_phase2/project/tests/test_pipeline/test_run_ingestion.py
++++ b/football_intel_backend_phase2/project/tests/test_pipeline/test_run_ingestion.py
+@@ -129,7 +129,7 @@ def test_unknown_provider_name_reported_clearly(tmp_path):
+ # rerun / idempotency
+ # ═══════════════════════════════════════════════════════════
+ 
+-def test_rerun_is_idempotent_for_non_history_tables(tmp_path):
++def test_rerun_is_idempotent_for_all_tables(tmp_path):
+     config = _config(tmp_path)
+     report1 = run_pipeline(config)
+     report2 = run_pipeline(config)
+@@ -144,15 +144,10 @@ def test_rerun_is_idempotent_for_non_history_tables(tmp_path):
+     assert report2.db_row_counts_after["appearances"] == report1.db_row_counts_after["appearances"] == 6
+     assert report2.db_row_counts_after["injury_data_status"] == report1.db_row_counts_after["injury_data_status"] == 5
+ 
+-    # identity_matches is DELIBERATELY append-only (full audit trail) — it DOES grow.
+-    # asserting this explicitly so it reads as intended behaviour, not a missed bug.
+-    assert report2.db_row_counts_after["identity_matches"] == 2 * report1.db_row_counts_after["identity_matches"]
+-
+-    # player_field_values: EA/transfermarkt rows are append-only by design (they double), while
+-    # wikidata rows are de-duplicated per dataset_version (Phase 2.6b) so a same-day rerun adds none.
+-    con = duckdb.connect(str(config.db_path))
+-    wikidata_rows = con.execute("select count(*) from player_field_values where source = 'wikidata'").fetchone()[0]
+-    con.close()
+-    core1 = report1.db_row_counts_after["player_field_values"] - wikidata_rows
+-    core2 = report2.db_row_counts_after["player_field_values"] - wikidata_rows
+-    assert core2 == 2 * core1
++    # G9 (owner decision): ingestion is idempotent. Re-running the SAME dataset adds no rows anywhere,
++    # including the append-only audit/history tables. They remain append-only for CHANGED data (see
++    # tests/test_idempotency/), but an identical rerun is a no-op. (This test previously asserted that
++    # identity_matches and the EA/transfermarkt rows of player_field_values DOUBLE on rerun "by design";
++    # that was the bug, not the design.)
++    assert report2.db_row_counts_after == report1.db_row_counts_after
++    assert report2.db_row_counts_after["identity_matches"] > 0 and report2.db_row_counts_after["player_field_values"] > 0
+diff --git a/football_intel_backend_phase2/project/tests/test_providers/test_wikidata.py b/football_intel_backend_phase2/project/tests/test_providers/test_wikidata.py
+index 4e5a261..f888308 100644
+--- a/football_intel_backend_phase2/project/tests/test_providers/test_wikidata.py
++++ b/football_intel_backend_phase2/project/tests/test_providers/test_wikidata.py
+@@ -40,9 +40,11 @@ def test_fetch_yields_5_records(provider):
+     assert all(r.source == "wikidata" and r.record_type == "player" for r in records)
+ 
+ 
+-def test_dataset_version_is_live_tagged(provider):
++def test_fixture_records_are_fixture_tagged_never_live(provider):
++    """G2: a local fixture read must never be labelled 'live:'."""
+     records = list(provider.fetch())
+-    assert all(r.dataset_version.startswith("live:") for r in records)
++    assert all(r.dataset_version.startswith("fixture:") for r in records)
++    assert not any(r.dataset_version.startswith("live:") for r in records)
+ 
+ 
+ def test_real_verified_haaland_record(provider):
