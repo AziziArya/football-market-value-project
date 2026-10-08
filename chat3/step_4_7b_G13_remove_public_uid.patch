@@ -1,0 +1,865 @@
+diff --git a/football_intel_backend_phase2/project/ARCHITECTURE_API.md b/football_intel_backend_phase2/project/ARCHITECTURE_API.md
+index 24788c0..1d688bd 100644
+--- a/football_intel_backend_phase2/project/ARCHITECTURE_API.md
++++ b/football_intel_backend_phase2/project/ARCHITECTURE_API.md
+@@ -1,6 +1,6 @@
+ # ARCHITECTURE_API - API service architecture (Step 3.3 design, Step 4.1 foundation built)
+ 
+-Status: **Step 4.1 implemented the foundation** (package `api/`, `getHealth`, `getDataFreshness`, RM1/RM2 + startup invariants), **Step 4.2 implemented `searchPlayers`** (RM3 aliases, search index, batch enrichment) and **Step 4.3 implemented `getPlayer`** and **Step 4.4 implemented `getPlayerMarketValue`** and **Step 4.5 implemented `getPlayerInjuries`** and **Step 4.6 implemented `getPlayerEaAttributes`**. Everything else below is still design: the one remaining sub-resource endpoint (lineage), ML and G1 are NOT built.
++Status: **Step 4.1 implemented the foundation** (package `api/`, `getHealth`, `getDataFreshness`, RM1/RM2 + startup invariants), **Step 4.2 implemented `searchPlayers`** (RM3 aliases, search index, batch enrichment) and **Step 4.3 implemented `getPlayer`** and **Step 4.4 implemented `getPlayerMarketValue`** and **Step 4.5 implemented `getPlayerInjuries`** and **Step 4.6 implemented `getPlayerEaAttributes`**; **Step 4.7b removed `canonical_player_uid` from the public contract (G13, contract 0.5.0-draft)**. Everything else below is still design: the one remaining sub-resource endpoint (lineage), ML and G1 are NOT built.
+ Inputs: the real repository, `api_contract/openapi.json` (Steps 3.1/3.2, 8 GET endpoints) and measurements taken on the real
+ 16,107-player database (section 13). If this document and `openapi.json` disagree, **the contract wins**.
+ 
+@@ -101,7 +101,7 @@ EA-only vs canonical: both are searchable; aliases exist only for canonical play
+ - Alias reporting: the best alias is chosen deterministically (aliases pre-sorted by source, normalized value); it is reported only if STRICTLY better than the EA name; aliases equal to the EA name are dropped at index time.
+ - Enrichment: canonical items need market value, injury state and image; they are loaded for the whole page with at most THREE queries (`list_contains(?, player_uid)`), none when the page holds only EA-only players (served entirely from memory, even if the database is lost after startup). Verified by a query-counting test (same count for 1 and 50 canonical items).
+ - `meta.contains_sample_data` = something SHOWN comes from a sample source: a source market value, an image, or a MATCHED/PROBABLE link (its ids). AMBIGUOUS/UNMATCHED/NOT_EVALUATED links show no sample data and do not count.
+-- `source_ids.transfermarkt_id` / `wikidata_id` are exposed only while the corresponding link is MATCHED/PROBABLE_MATCH (G12). `canonical_player_uid` is exposed but is random per database build (G13): clients use `id`.
++- `source_ids.transfermarkt_id` / `wikidata_id` are exposed only while the corresponding link is MATCHED/PROBABLE_MATCH (G12). `canonical_player_uid` is NOT part of the public API (G13, resolved in Step 4.7b: removed from the contract, 0.5.0-draft); the internal uid stays inside the database and the read model, and `identity` is exactly `entity_kind`, `source_ids`, `links`. Clients use `id`.
+ - Measured on the real database (16,107 players): 4-30 ms per search including a 50-item page; startup (RM1 + RM2 + RM3 + index) well under 1 s.
+ 
+ ### 6.2 `getPlayer` as implemented in Step 4.3
+@@ -109,7 +109,7 @@ EA-only vs canonical: both are searchable; aliases exist only for canonical play
+ - Malformed id -> `400 INVALID_PLAYER_ID` (the rejected value is never reflected: `detail` is fixed and `instance` is null). Well-formed but unknown id -> `404 PLAYER_NOT_FOUND`, the only 404. When the service is unavailable the answer is 503 (checked first).
+ - The route `/players/search` is registered BEFORE `/players/{player_id}`, so "search" is never read as an id (tested).
+ - The response is the SAME `PlayerSummary` as search (built by the same function) plus `provenance` and `meta`. `provenance` has one entry per source that contributed any shown block, in registry order: `ea_fc26` always; `transfermarkt_dataset` when a market value is shown (that value's provenance) or, failing that, when the Transfermarkt link is MATCHED/PROBABLE (its ids come from that source: the source's latest load is used); `wikidata` when its link is MATCHED/PROBABLE or an image is shown (the player's link row, else the source's latest load).
+-- EA-only players are served entirely from memory (0 queries, works even if the database is lost after startup); canonical players cost 3 batch queries + at most 1 (wikidata link) + at most 2 fallbacks. `canonical_player_uid` is still present in `identity` as a documented INTERNAL field (G13).
++- EA-only players are served entirely from memory (0 queries, works even if the database is lost after startup); canonical players cost 3 batch queries + at most 1 (wikidata link) + at most 2 fallbacks. The internal uid is not exposed anywhere (G13, Step 4.7b).
+ 
+ 
+ ### 6.3 `getPlayerMarketValue` as implemented in Step 4.4
+@@ -137,6 +137,14 @@ EA-only vs canonical: both are searchable; aliases exist only for canonical play
+ - Provenance: `ea_fc26`, its `dataset_version`, `fetched_at` (the EA field load time, whole seconds UTC) and `data_origin` `REAL_FULL`; identical in `provenance` and `ea_ingame_value.provenance`. `fetched_at` is NOT NULL in `player_field_values`, so the contract's nullable `fetched_at` never occurs in practice. `meta.contains_sample_data` is false.
+ - `overall_rating` / `potential` are non-null in the contract although the columns are nullable: the existing startup invariant (`integrity_service`) refuses to serve ANYTHING if one is NULL, so the endpoint can never emit a null rating (tested on a corrupted copy: 503 everywhere).
+ - Shared logic: the EA value / provenance construction was moved out of `build_summary` into `player_summary.ea_ingame_value` / `ea_provenance` (behaviour identical, covered by the existing tests) so that `getPlayer`, search and this endpoint can never diverge.
++
++### 6.6 G13 resolved in Step 4.7b: no internal uid in the public API
++- Decision (owner, option A of `STEP_4_7a_G13_DECISION.md`): `canonical_player_uid` is removed from the PUBLIC contract. Contract `0.4.0-draft` -> **`0.5.0-draft`**: `Identity.properties.canonical_player_uid` deleted (incl. its `x-source` and description), the key removed from the 8 example locations (profile x3, lineage x1, search items x4), `info.version` and every example `meta.contract_version` bumped. `Identity` is now exactly `entity_kind`, `source_ids`, `links`; `PlayerSummary`/`PlayerProfile` (search items, `getPlayer`) and the planned lineage response therefore carry no uid.
++- Code: `api/__init__.py` (`CONTRACT_VERSION`), `api/schemas/player.py` (field deleted; the model forbids extras, so building an `Identity` with a uid fails), `api/services/player_summary.py` (the argument is no longer passed; the local `uid` is still used for the internal market-value / injury / image lookups).
++- **Unchanged on purpose:** `players.player_uid` (uuid4 primary key, `matching/loader.py`), the read model `PlayerIndexRow.canonical_player_uid` (decides `entity_kind`), every repository query and join, all SQL, the database and the 6 migrations. The uid is still the internal identifier; it is just no longer public.
++- Still true: `ea:<ea_fc26_id>` is the only public id; `p:<uuid>`, the bare uuid and `p%3A<uuid>` are `400 INVALID_PLAYER_ID` on every player route and are never reflected.
++- Tripwires (`tests/test_api/test_no_public_uid.py`, 17 tests): the contract and the generated OpenAPI have no property containing `uid`; no example holds a uuid-shaped string; no response of the 7 built endpoints, of search listings or of error bodies contains the key, any uuid-shaped string, or the REAL internal uuid values (read from the in-memory index; with and without dashes); the internal uid is still in `players`, `v_players`, the read model and every uid-keyed join (anti over-removal); `p:<uuid>` stays 400. In the search tests `canonical_player_uid` was removed from `VOLATILE` so it can no longer be silently masked.
++- Assumption (not verified, not a new gap): that `ea:<ea_fc26_id>` itself stays stable across future EA dataset versions. If it ever proves false, the answer is a persistent identity registry as its own approved step (option C-full), not an exposed uid.
+ ## 7. Service rules: provenance, freshness, value separation
+ - `domain/source_registry`: `ea_fc26 -> REAL_FULL`; `transfermarkt_dataset -> SAMPLE_FIXTURE`; `wikidata -> SAMPLE_FIXTURE`; unknown source -> `UNKNOWN` (never REAL). It is changed deliberately when real data arrives; `dataset_version` text is never parsed for origin.
+ - `is_live` is the constant false until a provider with a real endpoint exists. `meta.generated_at` is response time; data age comes only from provenance.
+@@ -191,19 +199,19 @@ Names: 314 non-ASCII after NFKD only, 0 after the spec; 124 duplicate names (128
+ | G3 | KNOWN | EA `dataset_version` hard-coded `2025-09-19`, SoFIFA file dated 2025-09-21 | freshness shows the stored value; fix belongs to the data-integrity step |
+ | G4 | KNOWN | duplicated names (124/128) | ids are identity; search never merges |
+ | G5 | KNOWN | only 5 players have market value/injury state/image | UI/API must treat EA_ONLY as normal |
+-| G6 | KNOWN (by design) | no `players` row for 16,102 EA-only players | `ea:<id>` is the public id; `canonical_player_uid` null |
++| G6 | KNOWN (by design) | no `players` row for 16,102 EA-only players | `ea:<id>` is the public id; no internal uid exists for them (and none is exposed) |
+ | G7 | KNOWN | Transfermarkt/Wikidata/Commons are samples | registry marks SAMPLE_FIXTURE; `contains_sample_data` |
+ | G8 | KNOWN | ML slot exists, nothing writes it | AD-ML |
+ | G9 | FIXED | re-running ingestion into one DB duplicated EA/TM field rows and `is_best` matches | idempotent loaders (no migration); read models still use latest-per-key; legacy DBs are not auto-cleaned |
+ | G10 | RESOLVED | `requirements.txt` pinned duckdb 1.5.5, environment had 1.5.6 | keep `duckdb==1.5.5` (no change): both versions pass the full suite and produce identical, cross-readable databases |
+ | G11 | FIXED | `HealthResponse.status` allowed `unavailable` although `/health` 503 is a Problem | contract aligned (enum is `ok` only); service raises DATA_UNAVAILABLE |
+ | G12 | NEW | a canonical player whose Transfermarkt link is not MATCHED/PROBABLE (e.g. resolved by human review) hides its transfermarkt id (contract rule); none exists in today's data | tested with a corrupted copy; revisit with the review-resolution flow. Step 4.4 note: market values are read by `player_uid` exactly as `getPlayer` does, so such a player's values would still be listed (unverified, no such player exists) - decide together with G12 |
+-| G13 | DECIDED | `canonical_player_uid` is a random uuid per database build, so it changes on every rebuild | decision (Step 4.3): the only public id is `ea:<id>`; `p:<uuid>` is never accepted nor returned. The raw field `identity.canonical_player_uid` is still exposed as a documented internal value; removing it (or making it deterministic) is an open contract decision |
++| G13 | RESOLVED | `canonical_player_uid` is a random uuid per database build, so it changes on every rebuild | decision (Step 4.3): the only public id is `ea:<id>`; `p:<uuid>` is never accepted nor returned. **Step 4.7b (owner decision A): `identity.canonical_player_uid` removed from the public contract** (0.5.0-draft; schema `Identity`, 8 examples, `build_summary`); `players.player_uid` and every internal join are unchanged (no migration). Tripwires: `tests/test_api/test_no_public_uid.py` |
+ | G14 | FIXED | `overall_rating`/`potential` are nullable in `ea_fc26_attributes` but the contract (and the response models) require them: a NULL would have become a 500 | startup invariant (fail closed) + `PlayerCore.required` aligned in the contract (found by the conformance tests during the Step 4.3 verification) |
+ | G15 | NEW (Step 4.4) | `dataset_version` is an opaque text label; `latest` for two points on the SAME date relies on text ordering of the version (as the contract and `getPlayer` already do). Only the sample version exists today, so it cannot matter yet | when a second real dataset version is loaded, decide a comparable version scheme (or use `imported_at`) before relying on this tie-break |
+ | G16 | NEW (Step 4.5) | `InjuryRecord` has no per-record provenance (`data_origin`, `dataset_version`, `imported_at`) and the contract defines no record order; `HAS_RECORDS` is not required to have rows; `injury_records` has no logical key. All moot today (no source, no rows) | before ANY injury source is integrated: add record provenance to the contract (new contract version), define the order and the HAS_RECORDS <=> rows rule, add `injury` to the source registry. Until then the endpoint reports a stored `HAS_RECORDS` with no rows as stored (`records: []`) |
+ 
+-## 15. Implementation status (Steps 4.1-4.6) and what remains
++## 15. Implementation status (Steps 4.1-4.6, 4.7b) and what remains
+ Built: `api/` (config, errors, domain: enums/models/normalize/source registry/link rules/player index/**search**; readmodels: SQL definitions incl. RM3 and batch enrichment; repositories: read-only DuckDB, catalog, RM1/RM2/RM3, freshness, **player_detail**; services: integrity, health, freshness, **player_summary, search**; schemas incl. **player/search**; routers; `create_app`). Run: `uvicorn api.app:create_app --factory`.
+ Implemented endpoints: `getHealth`, `getDataFreshness`, `searchPlayers`, `getPlayer`, `getPlayerMarketValue`, `getPlayerInjuries`, `getPlayerEaAttributes`. Not built (framework-default 404): `getPlayerLineage`.
+ Decisions taken so far:
+diff --git a/football_intel_backend_phase2/project/CURRENT_STATUS.md b/football_intel_backend_phase2/project/CURRENT_STATUS.md
+index 8138983..73b52aa 100644
+--- a/football_intel_backend_phase2/project/CURRENT_STATUS.md
++++ b/football_intel_backend_phase2/project/CURRENT_STATUS.md
+@@ -19,7 +19,7 @@ frontend, UI. See `NEXT_PHASE.md`.
+ 
+ ## Test count
+ 
+-**677 tests, all passing**, across 17+ test files. See `TEST_STATUS.md`
++**694 tests, all passing**, across 17+ test files. See `TEST_STATUS.md`
+ for the full breakdown and what each category actually exercises.
+ 
+ ## Real-data validation status
+diff --git a/football_intel_backend_phase2/project/HANDOFF.md b/football_intel_backend_phase2/project/HANDOFF.md
+index 448f656..2e0aeb6 100644
+--- a/football_intel_backend_phase2/project/HANDOFF.md
++++ b/football_intel_backend_phase2/project/HANDOFF.md
+@@ -17,9 +17,9 @@ real data. Nothing beyond this has been started.
+ 
+ ## Exact test count
+ 
+-**677 tests, 0 failures.** Run `python3 -m pytest tests/` to verify —
++**694 tests, 0 failures.** Run `python3 -m pytest tests/` to verify —
+ this should be your first action in a new session, before reading
+-further or writing any code. If it doesn't say 677 passed, something in
++further or writing any code. If it doesn't say 694 passed, something in
+ the repository or environment has changed since this handoff was
+ written; investigate that discrepancy before proceeding.
+ 
+diff --git a/football_intel_backend_phase2/project/KNOWN_ISSUES.md b/football_intel_backend_phase2/project/KNOWN_ISSUES.md
+index b39c8a2..37eb2a6 100644
+--- a/football_intel_backend_phase2/project/KNOWN_ISSUES.md
++++ b/football_intel_backend_phase2/project/KNOWN_ISSUES.md
+@@ -161,12 +161,14 @@ canonical through human review can keep an AMBIGUOUS best match; its id is then
+ so a NULL would have produced a 500. Fixed (Step 4.3 verification): startup invariant (fail closed) and `PlayerCore.required`
+ aligned in the contract. Today all 16,107 rows have both.
+ 
+-## 14. (DECIDED) G13 - `canonical_player_uid` is not stable
++## 14. (RESOLVED) G13 - `canonical_player_uid` is not stable, so it is no longer public
+ 
+ It is a random uuid4 generated per database build, so every rebuild (build-then-swap) changes it. Decision (Step 4.3): the only
+ public API identifier is `ea:<ea_fc26_id>`; `p:<uuid>` is never accepted and never returned. The raw field
+-`identity.canonical_player_uid` is still exposed as a documented INTERNAL value; whether to remove it from the contract, or to make
+-the uid deterministic (data-integrity step), is still open.
++`identity.canonical_player_uid` was still exposed as a documented INTERNAL value; whether to remove it from the contract, or to make
++the uid deterministic, was left open. **Resolved in Step 4.7b (owner decision, option A):** the field is removed from the public contract
++(0.5.0-draft; schema, 8 examples, `build_summary`). The internal uid (`players.player_uid`, the read model, every join) is unchanged and no
++migration was made. See `STEP_4_7a_G13_DECISION.md` and `ARCHITECTURE_API.md` section 6.6.
+ 
+ ## 11. (RESOLVED) G10 - duckdb pin
+ 
+@@ -187,7 +189,7 @@ is loaded, decide a comparable version scheme (or use `imported_at`). Not a bug
+   exists, its values would still be listed although its Transfermarkt id is hidden. No such player exists; revisit together with G12.
+ - Running the test suite / the pipeline with default settings writes `data/processed/unified/football_intel.duckdb`, which `.gitignore` does not
+   cover, so it shows up as an untracked file in `git status`. It is an artifact, not source; not committed. (Unrelated to Step 4.4; left as is.)
+-- G13 (`canonical_player_uid`) is untouched: the field is still exposed in `identity` exactly as before; the new endpoint does not return it.
++- G13 (`canonical_player_uid`) was untouched by Step 4.4 (the new endpoint did not return it); superseded: resolved in Step 4.7b (#14).
+ 
+ ## 18. (NEW) G16 - the injury contract is not ready for a real source (Step 4.5)
+ 
+@@ -218,3 +220,16 @@ into one helper is an optional later cleanup, deliberately not done here (no unr
+   `player_field_values.fetched_at` is NOT NULL.
+ - Test-quality finding (fixed, same class as #19): the first mutation run caught a fabricated `fetched_at` only through a format check, not through its value. A
+   deterministic fixed-timestamp test now proves it alone catches a well-formed `now()` mutation.
++
++## 21. (NOTE) Step 4.7b findings, no product bug and no contract discrepancy
++
++- The removal needed exactly 7 existing assertions to change (all of them read the removed public key: 3 in `test_player_endpoint`, 3 in `test_search_endpoint`,
++  1 in `test_endpoint_contract`), plus the `VOLATILE` mask and the G13 pin in `test_architecture_doc`. No other test, endpoint, SQL, repository or
++  read model was affected; the internal uid is untouched (anti over-removal tests exist).
++- The `PlayerId` schema text still says the `p:<uuid>` form is rejected because the uuid is random per database build. That stays correct as the
++  reason for the 400 rule and was deliberately not edited.
++- Test-quality findings (fixed, none concerned the product): two test-construction errors in the new file (a wrong expected response count; a list/tuple
++  concatenation), one assertion that was always true (an `or ea_id in CANONICAL` that could never fail; replaced by the real fact that only Haaland has a
++  uid-joined Wikidata image), and one badly designed mutation (M16 only changed the message text; replaced by a mutation that echoes the rejected id in
++  `instance`, which the new tripwire catches on its own).
++- Assumption, not verified and not a new gap: `ea:<ea_fc26_id>` is assumed stable across future EA dataset versions.
+diff --git a/football_intel_backend_phase2/project/NEXT_PHASE.md b/football_intel_backend_phase2/project/NEXT_PHASE.md
+index a594787..1baa329 100644
+--- a/football_intel_backend_phase2/project/NEXT_PHASE.md
++++ b/football_intel_backend_phase2/project/NEXT_PHASE.md
+@@ -1,9 +1,10 @@
+ # NEXT PHASE — RECOMMENDATION (not implemented)
+ 
+-> **Status note (Step 4.6):** the API contract (`api_contract/openapi.json`) and the service architecture
++> **Status note (Step 4.7b):** the API contract (`api_contract/openapi.json`) and the service architecture
+ > (`ARCHITECTURE_API.md`) are written, and the API exists for `getHealth`, `getDataFreshness`, `searchPlayers`, `getPlayer`, `getPlayerMarketValue`, `getPlayerInjuries` and `getPlayerEaAttributes` (`api/`).
+ > The last contract endpoint (lineage), ML and frontend are NOT built.
+ > `/admin/*` endpoints and auth are deferred out of Phase 3. Anything below that mentions them is superseded by the contract.
++> G13 is resolved (Step 4.7b): `canonical_player_uid` is no longer part of the public contract (0.5.0-draft); the internal uid is unchanged.
+ 
+ 
+ This document describes the recommended next phase based on the actual
+diff --git a/football_intel_backend_phase2/project/PROJECT_MANIFEST.md b/football_intel_backend_phase2/project/PROJECT_MANIFEST.md
+index db1a783..80bd96e 100644
+--- a/football_intel_backend_phase2/project/PROJECT_MANIFEST.md
++++ b/football_intel_backend_phase2/project/PROJECT_MANIFEST.md
+@@ -87,7 +87,7 @@ Run: `uvicorn api.app:create_app --factory`.
+ | `generate_coverage_report.py` | CLI for the coverage report |
+ | `benchmark_loaders.py` | Standalone old-vs-new loader performance comparison (documents the Phase 2.3 185x fix) |
+ 
+-## `tests/` — 677 tests, mirrors the source layout
++## `tests/` — 694 tests, mirrors the source layout
+ 
+ | Path | Covers |
+ |---|---|
+diff --git a/football_intel_backend_phase2/project/README.md b/football_intel_backend_phase2/project/README.md
+index e972634..94ec9b6 100644
+--- a/football_intel_backend_phase2/project/README.md
++++ b/football_intel_backend_phase2/project/README.md
+@@ -22,7 +22,7 @@ coverage reporting → Wikidata enrichment) are **fully implemented and
+ tested**. See `CURRENT_STATUS.md` for the exact breakdown and
+ `HANDOFF.md` for what a new contributor/agent needs to know first.
+ 
+-**API (Steps 4.1-4.6)**: a read-only FastAPI package `api/` exposes `GET /api/v1/health`,
++**API (Steps 4.1-4.6, 4.7b)**: a read-only FastAPI package `api/` exposes `GET /api/v1/health`,
+ `GET /api/v1/data-freshness`, `GET /api/v1/players/search`, `GET /api/v1/players/{player_id}`, `GET /api/v1/players/{player_id}/market-value`, `GET /api/v1/players/{player_id}/injuries` and `GET /api/v1/players/{player_id}/ea-attributes` (see "Running the API").
+ **Not built yet, and not claimed to be built**: the last contract endpoint
+ (lineage), frontend/UI,
+@@ -108,7 +108,7 @@ its startup checks the API still starts, but every data endpoint answers `503 DA
+ ```bash
+ python3 -m pytest tests/
+ ```
+-Expected: **677 passed** (install `requirements-dev.txt`; the contract tests need `jsonschema`). No network access needed — all provider tests
++Expected: **694 passed** (install `requirements-dev.txt`; the contract tests need `jsonschema`). No network access needed — all provider tests
+ run against local files (the real EA FC26 CSV, included in this export
+ at `data/raw/ea_fc26/fc26_merged_clean.csv`, and the labeled sample
+ fixtures under `data/raw/transfermarkt_dataset/` and
+diff --git a/football_intel_backend_phase2/project/TEST_STATUS.md b/football_intel_backend_phase2/project/TEST_STATUS.md
+index 3388248..90819b8 100644
+--- a/football_intel_backend_phase2/project/TEST_STATUS.md
++++ b/football_intel_backend_phase2/project/TEST_STATUS.md
+@@ -1,6 +1,6 @@
+ # TEST STATUS
+ 
+-**677 tests, 0 failures**, run via `python3 -m pytest tests/`.
++**694 tests, 0 failures**, run via `python3 -m pytest tests/`.
+ Runtime: ~25-35 seconds for the full suite.
+ 
+ This document explains what each category actually exercises — not
+@@ -26,7 +26,7 @@ just that tests exist.
+ | `test_matching/test_wikidata_enrichment.py` | 17 | Conflict protection (3 distinct conflict shapes), no-fabrication (zero/multiple candidates, DOB conflict, unrelated person), missing-field NULL handling, idempotent rerun, DB constraint-level protection (`ConstraintException` on attempted re-link/QID-sharing) |
+ | `test_pipeline/test_run_ingestion.py` | 8 | Full real pipeline smoke test, missing-provider abort behavior, `--continue-on-error`, idempotent rerun (ALL tables unchanged since G9), **real 16,107-record performance regression guard (<30s ceiling)** |
+ | `test_idempotency/test_g9_rerun_invariants.py` | 9 | G9: rerun adds no rows in any table (also with the fixture's date changed), logical-key uniqueness, changed value / changed match outcome are appended (append-only kept), `is_current` is not a selection criterion, legacy duplicates are not grown/deleted, no new migration |
+-| `test_api/` | 426 | API (Steps 4.1-4.6; Step 4.6 added `test_ea_attributes_endpoint.py`, 48 tests: contract-example replay, exact comparison of all 16,107 players with the stored rows, no database access at all (cursor made to raise), EA value vs market value independence, PLANNED detailed attributes + the G1 premise test, NULL-value / NULL-foot / NULL-rating / missing-row behaviour, exact `fetched_at` pass-through, 404/400/405/503/500 problems, generated OpenAPI vs contract, read-only/determinism; Step 4.5 added `test_injuries_endpoint.py`, 51 tests: contract-example replay, NO_SOURCE_AVAILABLE / NOT_EVALUATED / pass-through of stored states, records only for HAS_RECORDS on SYNTHETIC rows in throwaway copies, nothing derived, order and tie-breaks, exact `checked_at` pass-through, 404/400/405/503/500 problems, 0/1/2 query counts + SQL spy, no mixed value domains, read-only/determinism; Step 4.4 added `test_market_value_endpoint.py`, 45 tests: contract-example replay, ordering/ties/duplicate collapsing on altered copies, NOT_MATCHED / NO_SOURCE_DATA, 404/400/503/500 problems, profile-vs-history consistency, exactly-one-query + only-`market_value_history` SQL spy, no mixed value domains, read-only/determinism, generated OpenAPI `required` == contract `required`): domain (enums vs contract, normalization == reference on all 16,107 names, registry, link rules, search incl. brute-force oracle), config, read-only repositories + RM1/RM2/RM3 (incl. legacy duplicates), fail-closed startup (8 corruption cases, no leaks), `/health`, `/data-freshness`, **`/players/search`**, **`/players/{player_id}`** (end-to-end differential test vs an independent oracle on the real data, pagination boundaries, filters, accents, duplicate names, aliases, no N+1 by query counting, honesty invariants, 19 validation cases, corrupted-DB cases), **`/players/{player_id}`** (id grammar incl. the removed `p:<uuid>` alias, 400/404, profile == search item + provenance + meta for 5 canonical + 120 random players, all 16,107 profiles through the service, provenance rules on altered data, query counts), generated-OpenAPI conformance, architecture fitness |
++| `test_api/` | 443 | API (Steps 4.1-4.6, 4.7b; Step 4.7b added `test_no_public_uid.py`, 17 tests: no uid property in the contract / generated OpenAPI, no uuid-shaped string in examples or in any real response, the REAL internal uuids (with and without dashes) never appear, the internal uid and its joins are intact (anti over-removal), `p:<uuid>` stays 400 on every player route; 7 existing assertions that read the removed key were rewritten; Step 4.6 added `test_ea_attributes_endpoint.py`, 48 tests: contract-example replay, exact comparison of all 16,107 players with the stored rows, no database access at all (cursor made to raise), EA value vs market value independence, PLANNED detailed attributes + the G1 premise test, NULL-value / NULL-foot / NULL-rating / missing-row behaviour, exact `fetched_at` pass-through, 404/400/405/503/500 problems, generated OpenAPI vs contract, read-only/determinism; Step 4.5 added `test_injuries_endpoint.py`, 51 tests: contract-example replay, NO_SOURCE_AVAILABLE / NOT_EVALUATED / pass-through of stored states, records only for HAS_RECORDS on SYNTHETIC rows in throwaway copies, nothing derived, order and tie-breaks, exact `checked_at` pass-through, 404/400/405/503/500 problems, 0/1/2 query counts + SQL spy, no mixed value domains, read-only/determinism; Step 4.4 added `test_market_value_endpoint.py`, 45 tests: contract-example replay, ordering/ties/duplicate collapsing on altered copies, NOT_MATCHED / NO_SOURCE_DATA, 404/400/503/500 problems, profile-vs-history consistency, exactly-one-query + only-`market_value_history` SQL spy, no mixed value domains, read-only/determinism, generated OpenAPI `required` == contract `required`): domain (enums vs contract, normalization == reference on all 16,107 names, registry, link rules, search incl. brute-force oracle), config, read-only repositories + RM1/RM2/RM3 (incl. legacy duplicates), fail-closed startup (8 corruption cases, no leaks), `/health`, `/data-freshness`, **`/players/search`**, **`/players/{player_id}`** (end-to-end differential test vs an independent oracle on the real data, pagination boundaries, filters, accents, duplicate names, aliases, no N+1 by query counting, honesty invariants, 19 validation cases, corrupted-DB cases), **`/players/{player_id}`** (id grammar incl. the removed `p:<uuid>` alias, 400/404, profile == search item + provenance + meta for 5 canonical + 120 random players, all 16,107 profiles through the service, provenance rules on altered data, query counts), generated-OpenAPI conformance, architecture fitness |
+ | `test_contract/` | 52 | API contract (openapi.json), architecture-doc and search-spec checks. Documentation tests: no API exists |
+ | `test_pipeline/test_wikidata_orchestration.py` | 11 | Enrichment runs only after matching+players exist (verified by inspecting DB state from inside a monkeypatched spy), non-blocking failure modes (missing fixture, fetch exception, mid-enrichment exception), core-failure-still-aborts-before-enrichment, enrichment errors appear in the saved JSON report |
+ | `test_reporting/test_coverage_report.py` | 9 | Synthetic completeness/lineage math, injury-gap detection (seeded a real gap, confirmed it's flagged), value-field separation in the report itself, **real-data smoke test** against an actual pipeline run |
+diff --git a/football_intel_backend_phase2/project/api/__init__.py b/football_intel_backend_phase2/project/api/__init__.py
+index f9887c5..8df5377 100644
+--- a/football_intel_backend_phase2/project/api/__init__.py
++++ b/football_intel_backend_phase2/project/api/__init__.py
+@@ -3,5 +3,5 @@
+ Contract: api_contract/openapi.json. Architecture: ARCHITECTURE_API.md. The API never writes to the database
+ and never imports the ingestion pipeline."""
+ 
+-CONTRACT_VERSION = "0.4.0-draft"   # must equal info.version of api_contract/openapi.json (checked by a test)
++CONTRACT_VERSION = "0.5.0-draft"   # must equal info.version of api_contract/openapi.json (checked by a test)
+ API_BASE_PATH = "/api/v1"
+diff --git a/football_intel_backend_phase2/project/api/schemas/player.py b/football_intel_backend_phase2/project/api/schemas/player.py
+index 584cdf0..211a67d 100644
+--- a/football_intel_backend_phase2/project/api/schemas/player.py
++++ b/football_intel_backend_phase2/project/api/schemas/player.py
+@@ -44,7 +44,6 @@ class SourceIds(_Model):
+ 
+ class Identity(_Model):
+     entity_kind: EntityKind
+-    canonical_player_uid: str | None = None
+     source_ids: SourceIds
+     links: Links
+ 
+diff --git a/football_intel_backend_phase2/project/api/services/player_summary.py b/football_intel_backend_phase2/project/api/services/player_summary.py
+index c15d4ff..066016d 100644
+--- a/football_intel_backend_phase2/project/api/services/player_summary.py
++++ b/football_intel_backend_phase2/project/api/services/player_summary.py
+@@ -63,7 +63,7 @@ def build_summary(row: PlayerIndexRow, links: Mapping[str, LinkStateRow], detail
+     canonical = row.entity_kind is EntityKind.CANONICAL
+     uid = row.canonical_player_uid
+     identity = Identity(
+-        entity_kind=row.entity_kind, canonical_player_uid=uid,
++        entity_kind=row.entity_kind,
+         # source ids are exposed ONLY while the link itself is MATCHED/PROBABLE_MATCH (contract SourceIds)
+         source_ids=SourceIds(ea_fc26_id=row.ea_fc26_id,
+                              transfermarkt_id=row.transfermarkt_id if tm.status in LINKED else None,
+diff --git a/football_intel_backend_phase2/project/api_contract/API_CONTRACT.md b/football_intel_backend_phase2/project/api_contract/API_CONTRACT.md
+index 9b45fcc..e8c13a8 100644
+--- a/football_intel_backend_phase2/project/api_contract/API_CONTRACT.md
++++ b/football_intel_backend_phase2/project/api_contract/API_CONTRACT.md
+@@ -1,4 +1,4 @@
+-# API contract (Steps 3.1 + 3.2, v0.4.0-draft) - DRAFT (implemented: `getHealth`, `getDataFreshness`, `searchPlayers`, `getPlayer`, `getPlayerMarketValue`, `getPlayerInjuries`, `getPlayerEaAttributes`)
++# API contract (Steps 3.1 + 3.2, v0.5.0-draft) - DRAFT (implemented: `getHealth`, `getDataFreshness`, `searchPlayers`, `getPlayer`, `getPlayerMarketValue`, `getPlayerInjuries`, `getPlayerEaAttributes`)
+ 
+ Machine-readable: `openapi.json` (OpenAPI 3.1, 8 GET endpoints, 40 schemas, 14 examples).
+ Checked by `tests/test_contract/` (schema drift, endpoint list, examples validate, honesty invariants).
+@@ -6,7 +6,7 @@ Checked by `tests/test_contract/` (schema drift, endpoint list, examples validat
+ 
+ ## Decisions
+ D1 all 16,107 EA players exposed; 5 `CANONICAL`, 16,102 `EA_ONLY`; nothing inferred for EA-only.
+-D2 public id `ea:<ea_fc26_id>` (stable, never changes on later match) is the ONLY API identifier. `p:<uuid>` is never accepted (400 `INVALID_PLAYER_ID`) and never returned (G13: the uuid is random per database build).
++D2 public id `ea:<ea_fc26_id>` (stable, never changes on later match) is the ONLY API identifier. `p:<uuid>` is never accepted (400 `INVALID_PLAYER_ID`) and never returned (G13: the uuid is random per database build). Since 0.5.0-draft (Step 4.7b) the internal uid is not part of the contract at all: `identity` is exactly `entity_kind`, `source_ids`, `links`.
+ D3 display fields for everyone come from `player_field_values` (source `ea_fc26`, `source_record_id` = EA id).
+ D4 match status (`identity.links.*`) and source data blocks are separate. D5 every empty block has an `Availability`.
+ D6 three value blocks: `ea_ingame_value`, `source_market_value`, `model_estimate` (`target: EA_INGAME_VALUE`, PLANNED).
+@@ -41,13 +41,16 @@ Names are not identifiers (124 duplicated EA names): every item carries club, na
+ Id: `^ea:(0|[1-9][0-9]{0,8})$` only. Malformed (incl. `p:<uuid>`, wrong case, leading zeros, non-ASCII digits, trailing characters) -> 400 `INVALID_PLAYER_ID` with `instance` null (the rejected value is not reflected); unknown well-formed id -> 404. `provenance` = one entry per contributing source in registry order (see `ARCHITECTURE_API.md` 6.2).
+ 
+ ## getPlayerMarketValue behaviour decided in Step 4.4
+-Same id grammar and errors as `getPlayer`. Source market value only (never EA value or model estimate; no derived fields). EA-only -> `200 NOT_MATCHED`, empty `points`, `latest` null. Canonical without rows -> `200 NO_SOURCE_DATA`. `points` sorted `valuation_date` ASC then `dataset_version` ASC; `latest` = last point (highest date, ties -> newest dataset_version) = the value `getPlayer` shows. Rows with the same `(valuation_date, source, dataset_version)` collapse to the latest import. A NULL source column omits `source` from the point and gives `data_origin` UNKNOWN. `contains_sample_data` = a shown point is SAMPLE_FIXTURE. The contract itself is unchanged (still 0.4.0-draft): the implementation conforms to it.
++Same id grammar and errors as `getPlayer`. Source market value only (never EA value or model estimate; no derived fields). EA-only -> `200 NOT_MATCHED`, empty `points`, `latest` null. Canonical without rows -> `200 NO_SOURCE_DATA`. `points` sorted `valuation_date` ASC then `dataset_version` ASC; `latest` = last point (highest date, ties -> newest dataset_version) = the value `getPlayer` shows. Rows with the same `(valuation_date, source, dataset_version)` collapse to the latest import. A NULL source column omits `source` from the point and gives `data_origin` UNKNOWN. `contains_sample_data` = a shown point is SAMPLE_FIXTURE. The contract was not changed by that Step (0.4.0-draft at the time); the implementation conforms to it.
+ 
+ ## getPlayerInjuries behaviour decided in Step 4.5
+-Same id grammar and errors as `getPlayer`. Still `SCHEMA_ONLY` in the contract: no injury source, no writer, no rows. EA-only (or a canonical player without a status row) -> `200 NOT_EVALUATED`, `checked_at` null, `records` []. Canonical -> the stored `injury_data_status` (today `NO_SOURCE_AVAILABLE` = "no source", never "no injuries"). `records` is read only when the stored status is `HAS_RECORDS` and is passed through as stored (no derived values; order `start_date`, `expected_return`, `id` ASC, NULLs last). No derived metric and no market-value impact. The contract itself is unchanged (0.4.0-draft); see gap G16 in `ARCHITECTURE_API.md` for what must be added to it before a real injury source exists.
++Same id grammar and errors as `getPlayer`. Still `SCHEMA_ONLY` in the contract: no injury source, no writer, no rows. EA-only (or a canonical player without a status row) -> `200 NOT_EVALUATED`, `checked_at` null, `records` []. Canonical -> the stored `injury_data_status` (today `NO_SOURCE_AVAILABLE` = "no source", never "no injuries"). `records` is read only when the stored status is `HAS_RECORDS` and is passed through as stored (no derived values; order `start_date`, `expected_return`, `id` ASC, NULLs last). No derived metric and no market-value impact. The contract was not changed by that Step (0.4.0-draft at the time); see gap G16 in `ARCHITECTURE_API.md` for what must be added to it before a real injury source exists.
+ 
+ ## getPlayerEaAttributes behaviour decided in Step 4.6
+-Same id grammar and errors as `getPlayer`. Served entirely from the in-memory player index (no database access, no new SQL): `overall_rating`, `potential`, `preferred_foot`, the EA in-game value (NOT a market value; no market value or model estimate in the response) and provenance (`ea_fc26`, `REAL_FULL`). Every player has an EA row, so EA-only and canonical players are answered alike. `detailed_attributes` is PLANNED: `NOT_YET_INTEGRATED` / null until G1 stores the attributes. A NULL EA value would be `NO_SOURCE_DATA`, never 0. The contract itself is unchanged (0.4.0-draft); no ambiguity about PLANNED/null was found.
++Same id grammar and errors as `getPlayer`. Served entirely from the in-memory player index (no database access, no new SQL): `overall_rating`, `potential`, `preferred_foot`, the EA in-game value (NOT a market value; no market value or model estimate in the response) and provenance (`ea_fc26`, `REAL_FULL`). Every player has an EA row, so EA-only and canonical players are answered alike. `detailed_attributes` is PLANNED: `NOT_YET_INTEGRATED` / null until G1 stores the attributes. A NULL EA value would be `NO_SOURCE_DATA`, never 0. The contract was not changed by that Step (0.4.0-draft at the time); no ambiguity about PLANNED/null was found.
++
++## 0.5.0-draft - G13 resolved (Step 4.7b)
++Removed `Identity.canonical_player_uid` (schema property + `x-source` + description) and the key in the 8 example locations; `info.version` and every example `meta.contract_version` -> `0.5.0-draft`. Breaking only for a reader of that OPTIONAL property (it was never in `required` and never usable as an input; no consumer is known: no frontend, API not deployed). Unchanged: `PlayerId` rules (`ea:<id>` only, `p:<uuid>` -> 400), all other schemas, all endpoints, the database. The internal uid still exists in the database and the read model.
+ 
+ ## Error model
+ `application/problem+json` (RFC 9457): `type,title,status,code,detail,instance,errors[]`.
+@@ -70,7 +73,7 @@ Freshness: nothing is live (`is_live` const false); `ea_fc26` REAL_FULL `2025-09
+ - **G2 (FIXED)** fixture rows are now `fixture:<content-hash>`; `live:` reserved for a real endpoint path. Old DBs keep old labels until rebuilt.
+ - **G3** EA `dataset_version` hard-coded `2025-09-19` vs SoFIFA file dated 2025-09-21.
+ - **G4** duplicated names. **G5** only 5 players have market-value/injury-state/image data.
+-- **G6 (new)** no `players` row exists for EA-only players, so `p:` ids and `canonical_player_uid` are null for 16,102 players by design.
++- **G6 (new)** no `players` row exists for EA-only players, so no internal uid exists for 16,102 players by design (and no uid is exposed for anyone since 0.5.0-draft).
+ - **G7 (new)** Transfermarkt/Wikidata/Commons data is sample-only, so examples show fixture values (marked SAMPLE_FIXTURE).
+ - **G8 (new)** `ea_fc26_attributes.model_version`/`predicted_value_eur` are the ML slot; nothing writes them.
+ 
+diff --git a/football_intel_backend_phase2/project/api_contract/openapi.json b/football_intel_backend_phase2/project/api_contract/openapi.json
+index 390b736..33e1431 100644
+--- a/football_intel_backend_phase2/project/api_contract/openapi.json
++++ b/football_intel_backend_phase2/project/api_contract/openapi.json
+@@ -2,7 +2,7 @@
+   "openapi": "3.1.0",
+   "info": {
+     "title": "Football Player Intelligence API - contract",
+-    "version": "0.4.0-draft",
++    "version": "0.5.0-draft",
+     "description": "CONTRACT - Implemented so far: getHealth, getDataFreshness (Step 4.1) searchPlayers (Step 4.2) and getPlayer (Step 4.3); every other operation is still contract-only. Step 3.1 (identity/provenance) + Step 3.2 (paths). Every leaf property has x-source (real table/column) or x-derived (rule). x-status: IMPLEMENTABLE_TODAY = producible from the current DB; SCHEMA_ONLY = table exists but is empty; PLANNED = not produced yet, always nullable/availability-tagged. Examples were generated from a local sandbox run of the real pipeline (16,107 EA players + the two sample fixtures); timestamps belong to that run."
+   },
+   "paths": {
+@@ -550,17 +550,6 @@
+           "entity_kind": {
+             "$ref": "#/components/schemas/EntityKind"
+           },
+-          "canonical_player_uid": {
+-            "type": [
+-              "string",
+-              "null"
+-            ],
+-            "x-source": {
+-              "table": "v_players",
+-              "column": "player_uid"
+-            },
+-            "description": "INTERNAL and NOT stable: a random uuid generated per database build, so it changes whenever the database is rebuilt. Never an identifier for API calls (`p:<uuid>` is not accepted). Clients must identify players only by `id` (`ea:<ea_fc26_id>`)."
+-          },
+           "source_ids": {
+             "$ref": "#/components/schemas/SourceIds"
+           },
+@@ -1793,7 +1782,6 @@
+           "potential": 92,
+           "identity": {
+             "entity_kind": "CANONICAL",
+-            "canonical_player_uid": "a2cd8b06-0ee1-467d-a56d-a222c3512e52",
+             "source_ids": {
+               "ea_fc26_id": 239085,
+               "transfermarkt_id": 418560,
+@@ -1885,7 +1873,7 @@
+             }
+           ],
+           "meta": {
+-            "contract_version": "0.4.0-draft",
++            "contract_version": "0.5.0-draft",
+             "generated_at": "2026-10-02T07:09:39Z",
+             "contains_sample_data": true
+           }
+@@ -1905,7 +1893,6 @@
+           "potential": 91,
+           "identity": {
+             "entity_kind": "EA_ONLY",
+-            "canonical_player_uid": null,
+             "source_ids": {
+               "ea_fc26_id": 209331,
+               "transfermarkt_id": null,
+@@ -1966,7 +1953,7 @@
+             }
+           ],
+           "meta": {
+-            "contract_version": "0.4.0-draft",
++            "contract_version": "0.5.0-draft",
+             "generated_at": "2026-10-02T07:09:39Z",
+             "contains_sample_data": false
+           }
+@@ -1986,7 +1973,6 @@
+           "potential": 79,
+           "identity": {
+             "entity_kind": "EA_ONLY",
+-            "canonical_player_uid": null,
+             "source_ids": {
+               "ea_fc26_id": 233097,
+               "transfermarkt_id": null,
+@@ -2047,7 +2033,7 @@
+             }
+           ],
+           "meta": {
+-            "contract_version": "0.4.0-draft",
++            "contract_version": "0.5.0-draft",
+             "generated_at": "2026-10-02T07:09:39Z",
+             "contains_sample_data": false
+           }
+@@ -2089,7 +2075,7 @@
+             "data_origin": "SAMPLE_FIXTURE"
+           },
+           "meta": {
+-            "contract_version": "0.4.0-draft",
++            "contract_version": "0.5.0-draft",
+             "generated_at": "2026-09-30T20:30:00Z",
+             "contains_sample_data": true
+           }
+@@ -2103,7 +2089,7 @@
+           "points": [],
+           "latest": null,
+           "meta": {
+-            "contract_version": "0.4.0-draft",
++            "contract_version": "0.5.0-draft",
+             "generated_at": "2026-09-30T20:30:00Z",
+             "contains_sample_data": false
+           }
+@@ -2137,7 +2123,7 @@
+             "data_origin": "REAL_FULL"
+           },
+           "meta": {
+-            "contract_version": "0.4.0-draft",
++            "contract_version": "0.5.0-draft",
+             "generated_at": "2026-09-30T20:30:00Z",
+             "contains_sample_data": false
+           }
+@@ -2153,7 +2139,7 @@
+           },
+           "records": [],
+           "meta": {
+-            "contract_version": "0.4.0-draft",
++            "contract_version": "0.5.0-draft",
+             "generated_at": "2026-09-30T20:30:00Z",
+             "contains_sample_data": false
+           }
+@@ -2169,7 +2155,7 @@
+           },
+           "records": [],
+           "meta": {
+-            "contract_version": "0.4.0-draft",
++            "contract_version": "0.5.0-draft",
+             "generated_at": "2026-09-30T20:30:00Z",
+             "contains_sample_data": false
+           }
+@@ -2181,7 +2167,6 @@
+           "player_id": "ea:238794",
+           "identity": {
+             "entity_kind": "CANONICAL",
+-            "canonical_player_uid": "bdfaa72e-a493-40b4-a15e-0117251dab30",
+             "source_ids": {
+               "ea_fc26_id": 238794,
+               "transfermarkt_id": 371998,
+@@ -2317,7 +2302,7 @@
+             }
+           ],
+           "meta": {
+-            "contract_version": "0.4.0-draft",
++            "contract_version": "0.5.0-draft",
+             "generated_at": "2026-09-30T20:30:00Z",
+             "contains_sample_data": true
+           }
+@@ -2379,7 +2364,7 @@
+             }
+           ],
+           "meta": {
+-            "contract_version": "0.4.0-draft",
++            "contract_version": "0.5.0-draft",
+             "generated_at": "2026-09-30T20:30:00Z",
+             "contains_sample_data": true
+           }
+@@ -2390,7 +2375,7 @@
+         "value": {
+           "status": "ok",
+           "database_reachable": true,
+-          "contract_version": "0.4.0-draft"
++          "contract_version": "0.5.0-draft"
+         }
+       },
+       "problem_invalid_q": {
+@@ -2437,7 +2422,6 @@
+               "potential": 92,
+               "identity": {
+                 "entity_kind": "CANONICAL",
+-                "canonical_player_uid": "159dbe19-29f9-4f3a-8277-879633033330",
+                 "source_ids": {
+                   "ea_fc26_id": 238794,
+                   "transfermarkt_id": 371998,
+@@ -2512,7 +2496,7 @@
+           "next_offset": null,
+           "query_normalized": "vinicius",
+           "meta": {
+-            "contract_version": "0.4.0-draft",
++            "contract_version": "0.5.0-draft",
+             "generated_at": "2026-10-02T00:24:57Z",
+             "contains_sample_data": true
+           }
+@@ -2534,7 +2518,6 @@
+               "potential": 73,
+               "identity": {
+                 "entity_kind": "EA_ONLY",
+-                "canonical_player_uid": null,
+                 "source_ids": {
+                   "ea_fc26_id": 255472,
+                   "transfermarkt_id": null,
+@@ -2604,7 +2587,6 @@
+               "potential": 66,
+               "identity": {
+                 "entity_kind": "EA_ONLY",
+-                "canonical_player_uid": null,
+                 "source_ids": {
+                   "ea_fc26_id": 73437,
+                   "transfermarkt_id": null,
+@@ -2669,7 +2651,7 @@
+           "next_offset": 2,
+           "query_normalized": "pedrinho",
+           "meta": {
+-            "contract_version": "0.4.0-draft",
++            "contract_version": "0.5.0-draft",
+             "generated_at": "2026-10-02T00:24:57Z",
+             "contains_sample_data": false
+           }
+@@ -2691,7 +2673,6 @@
+               "potential": 79,
+               "identity": {
+                 "entity_kind": "EA_ONLY",
+-                "canonical_player_uid": null,
+                 "source_ids": {
+                   "ea_fc26_id": 233097,
+                   "transfermarkt_id": null,
+@@ -2756,7 +2737,7 @@
+           "next_offset": null,
+           "query_normalized": "drongelen",
+           "meta": {
+-            "contract_version": "0.4.0-draft",
++            "contract_version": "0.5.0-draft",
+             "generated_at": "2026-10-02T00:24:57Z",
+             "contains_sample_data": false
+           }
+diff --git a/football_intel_backend_phase2/project/tests/test_api/test_no_public_uid.py b/football_intel_backend_phase2/project/tests/test_api/test_no_public_uid.py
+new file mode 100644
+index 0000000..0dd2430
+--- /dev/null
++++ b/football_intel_backend_phase2/project/tests/test_api/test_no_public_uid.py
+@@ -0,0 +1,217 @@
++"""G13 / Step 4.7b: `canonical_player_uid` is NOT part of the public API any more.
++
++What these tests pin down:
++  1. the public contract and the generated OpenAPI have no uid property at all (contract 0.5.0-draft);
++  2. no real response (all 7 built endpoints, search listings, error bodies) contains the key or the REAL uuid values of the internal uids;
++  3. the INTERNAL uid is untouched (players.player_uid, the read model, every repository join) - this is not an over-removal;
++  4. `p:<uuid>` is still invalid everywhere and `ea:<id>` is still the only public id."""
++import json
++import logging
++import re
++
++import duckdb
++import pytest
++from fastapi.testclient import TestClient
++
++from api import CONTRACT_VERSION
++from api.app import create_app
++from api.config import ApiConfig
++from api.schemas.player import Identity
++from pydantic import ValidationError
++
++P = "/api/v1/players/"
++HAALAND, SALAH, VAN_DRONGELEN, VINI, MBAPPE, SAKA, BELLINGHAM = 239085, 209331, 233097, 238794, 231747, 246669, 252371
++CANONICAL = (MBAPPE, VINI, HAALAND, SAKA, BELLINGHAM)
++SAMPLE = (*CANONICAL, SALAH, VAN_DRONGELEN)
++UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
++IDENTITY_KEYS = {"entity_kind", "source_ids", "links"}
++SUBRESOURCES = ("", "/market-value", "/injuries", "/ea-attributes")
++
++
++@pytest.fixture(scope="module")
++def client(full_db):
++    logging.getLogger("api").setLevel(logging.CRITICAL)
++    with TestClient(create_app(ApiConfig(db_path=full_db)), raise_server_exceptions=False) as c:
++        yield c
++
++
++@pytest.fixture(scope="module")
++def internal_uids(client):
++    """The REAL uuids of the 5 canonical players, taken from the INTERNAL in-memory index (not from any response)."""
++    index = client.app.state.services.runtime.state.index
++    uids = {ea_id: index.get(ea_id).canonical_player_uid for ea_id in CANONICAL}
++    assert all(UUID_RE.fullmatch(u) for u in uids.values()) and len(set(uids.values())) == 5
++    return uids
++
++
++def property_names(node):
++    """Every property NAME declared anywhere in a schema document (values such as x-source columns are not names)."""
++    names = set()
++    if isinstance(node, dict):
++        for key, value in node.items():
++            if key == "properties" and isinstance(value, dict):
++                names |= set(value)
++            names |= property_names(value)
++    elif isinstance(node, list):
++        for value in node:
++            names |= property_names(value)
++    return names
++
++
++def keys_anywhere(node):
++    keys = set()
++    if isinstance(node, dict):
++        for key, value in node.items():
++            keys.add(key)
++            keys |= keys_anywhere(value)
++    elif isinstance(node, list):
++        for value in node:
++            keys |= keys_anywhere(value)
++    return keys
++
++
++# ============================== 1. contract and generated OpenAPI ==============================
++def test_contract_version_is_0_5_0_draft_everywhere(contract):
++    assert contract["info"]["version"] == CONTRACT_VERSION == "0.5.0-draft"
++    versions = {e["value"]["meta"]["contract_version"] for e in contract["components"]["examples"].values() if "meta" in e["value"]}
++    assert versions == {"0.5.0-draft"}
++    assert "0.4.0" not in json.dumps(contract)
++
++
++def test_contract_declares_no_uid_property_and_no_uid_anywhere(contract):
++    text = json.dumps(contract)
++    assert "canonical_player_uid" not in text
++    assert not [n for n in property_names(contract) if "uid" in n.lower()]
++    assert not UUID_RE.search(text)                                  # not even a sandbox uuid left in an example
++    assert set(contract["components"]["schemas"]["Identity"]["properties"]) == IDENTITY_KEYS
++    assert set(contract["components"]["schemas"]["Identity"]["required"]) == IDENTITY_KEYS
++
++
++def test_every_example_identity_has_exactly_the_public_keys(contract):
++    seen = 0
++    for name, ex in contract["components"]["examples"].items():
++        def walk(node):
++            nonlocal seen
++            if isinstance(node, dict):
++                if "entity_kind" in node and "source_ids" in node:
++                    assert set(node) == IDENTITY_KEYS, name
++                    seen += 1
++                for v in node.values():
++                    walk(v)
++            elif isinstance(node, list):
++                for v in node:
++                    walk(v)
++        walk(ex["value"])
++    assert seen >= 8                                                  # profile x3, lineage x1, search items x4 (at least)
++
++
++def test_generated_openapi_has_no_uid_property(small_db, make_client, contract):
++    gen = make_client(small_db, enable_docs=True).get("/openapi.json").json()
++    assert not [n for n in property_names(gen) if "uid" in n.lower()]
++    assert "canonical_player_uid" not in json.dumps(gen)
++    assert set(gen["components"]["schemas"]["Identity"]["properties"]) == IDENTITY_KEYS
++    assert set(gen["components"]["schemas"]["Identity"]["required"]) == IDENTITY_KEYS
++    assert gen["info"]["version"] == contract["info"]["version"]
++
++
++def test_the_identity_model_cannot_carry_a_uid_even_by_mistake():
++    assert set(Identity.model_fields) == IDENTITY_KEYS
++    with pytest.raises(ValidationError):                              # extra="forbid": building an Identity with a uid fails loudly
++        Identity(entity_kind="CANONICAL", canonical_player_uid="x", source_ids={"ea_fc26_id": 1}, links={})
++
++
++# ============================== 2. real responses ==============================
++def public_texts(client):
++    """Raw bodies of every built endpoint for the sample players + search listings + error bodies."""
++    texts = [client.get("/api/v1/health").text, client.get("/api/v1/data-freshness").text]
++    for ea_id in SAMPLE:
++        texts += [client.get(f"{P}ea:{ea_id}{tail}").text for tail in SUBRESOURCES]
++    for q in ("haaland", "salah", "vinicius", "mbappe", "saka", "bellingham", "van drongelen", "an", "ma"):
++        texts.append(client.get(f"{P}search?q={q}&limit=50").text)
++    for offset in (0, 50):
++        texts.append(client.get(f"{P}search?q=an&limit=50&offset={offset}&entity_kind=CANONICAL").text)
++    texts += [client.get(f"{P}ea:1").text, client.get(f"{P}p:abc").text, client.get(f"{P}search?q=").text]
++    return texts
++
++
++def test_no_response_contains_the_key_or_any_uuid_shaped_string(client):
++    texts = public_texts(client)
++    assert len(texts) == 2 + len(SAMPLE) * len(SUBRESOURCES) + 9 + 2 + 3                # health, freshness, 7 players x 4 routes, 9 searches, 2 listings, 3 errors
++    for text in texts:
++        assert "canonical_player_uid" not in text and not UUID_RE.search(text) and "p:" not in text.replace("p:<", "")
++
++
++def test_no_response_contains_a_real_internal_uid_value(client, internal_uids):
++    uids = list(internal_uids.values())
++    for text in public_texts(client):
++        for uid in uids:
++            assert uid not in text and uid.replace("-", "") not in text
++
++
++def test_identity_of_every_search_hit_and_profile_has_exactly_three_keys(client):
++    for ea_id in SAMPLE:
++        assert set(client.get(f"{P}ea:{ea_id}").json()["identity"]) == IDENTITY_KEYS
++    for q in ("haaland", "salah", "an"):
++        for item in client.get(f"{P}search?q={q}&limit=50").json()["items"]:
++            assert set(item["identity"]) == IDENTITY_KEYS
++
++
++def test_canonical_and_ea_only_are_still_told_apart_by_entity_kind(client):
++    kinds = {ea_id: client.get(f"{P}ea:{ea_id}").json()["identity"]["entity_kind"] for ea_id in SAMPLE}
++    assert {k for e, k in kinds.items() if e in CANONICAL} == {"CANONICAL"} and {kinds[SALAH], kinds[VAN_DRONGELEN]} == {"EA_ONLY"}
++    canonical_hits = client.get(f"{P}search?q=an&limit=50&entity_kind=CANONICAL").json()
++    assert canonical_hits["total"] >= 1 and all(i["identity"]["entity_kind"] == "CANONICAL" for i in canonical_hits["items"])
++
++
++def test_the_whole_universe_serializes_without_a_uid(client, internal_uids):
++    svc = client.app.state.services.player
++    uids = list(internal_uids.values())
++    rows = list(client.app.state.services.runtime.state.index.rows)
++    sample = [r for r in rows if r.canonical_player_uid] + rows[::40]
++    for r in sample:
++        text = svc.get(f"ea:{r.ea_fc26_id}").model_dump_json()
++        assert "canonical_player_uid" not in text and not any(u in text for u in uids) and not UUID_RE.search(text)
++
++
++# ============================== 3. the INTERNAL uid is untouched ==============================
++def test_the_internal_uid_still_exists_in_the_database_and_the_read_model(client, full_db, internal_uids):
++    con = duckdb.connect(str(full_db), read_only=True)
++    players = dict(con.execute("select ea_fc26_id, player_uid from players").fetchall())
++    assert {k: players[k] for k in CANONICAL} == internal_uids and len(players) == 5     # players.player_uid unchanged
++    assert con.execute("select count(*) from v_players where player_uid is not null").fetchone()[0] == 5
++    assert con.execute("select count(distinct player_uid) from market_value_history where player_uid is not null").fetchone()[0] == 5
++    assert con.execute("select count(distinct player_uid) from injury_data_status").fetchone()[0] == 5
++    con.close()
++    index = client.app.state.services.runtime.state.index
++    assert all(index.get(e).canonical_player_uid == u and index.get(e).entity_kind.value == "CANONICAL" for e, u in internal_uids.items())
++    assert index.get(SALAH).canonical_player_uid is None and index.get(SALAH).entity_kind.value == "EA_ONLY"
++
++
++def test_internal_joins_by_uid_still_work_through_every_endpoint(client):
++    for ea_id in CANONICAL:                                          # all four use the internal uid as the join key
++        assert client.get(f"{P}ea:{ea_id}/market-value").json()["availability"] == "AVAILABLE"
++        assert client.get(f"{P}ea:{ea_id}/injuries").json()["injury"]["status"] == "NO_SOURCE_AVAILABLE"
++        prof = client.get(f"{P}ea:{ea_id}").json()
++        assert prof["values"]["source_market_value"]["availability"] == "AVAILABLE" and prof["injury"]["status"] == "NO_SOURCE_AVAILABLE"
++        assert (prof["image"] is not None) == (ea_id == HAALAND)         # the image join is by uid too: only Haaland has a (sample) Wikidata image
++    assert client.get(f"{P}ea:{HAALAND}").json()["identity"]["source_ids"]["transfermarkt_id"] == 418560
++    assert client.get(f"{P}ea:{HAALAND}").json()["image"]["source"] == "wikidata"
++
++
++# ============================== 4. p:<uuid> and the public id ==============================
++@pytest.mark.parametrize("tail", SUBRESOURCES)
++def test_p_uuid_is_still_400_on_every_player_route_and_never_reflected(client, internal_uids, tail):
++    uid = internal_uids[HAALAND]
++    for bad in (f"p:{uid}", f"p%3A{uid}", uid, "p:3943921e-6d70-4677-acb2-bceb4988cf07"):
++        r = client.get(f"{P}{bad}{tail}")
++        assert r.status_code == 400 and r.headers["content-type"].startswith("application/problem+json"), bad
++        assert r.json()["code"] == "INVALID_PLAYER_ID" and r.json()["instance"] is None
++        assert uid not in r.text and "3943921e" not in r.text
++
++
++def test_the_only_public_id_is_still_ea_n(client):
++    assert client.get(f"{P}ea:{HAALAND}").json()["id"] == f"ea:{HAALAND}"
++    for item in client.get(f"{P}search?q=an&limit=50").json()["items"]:
++        assert re.fullmatch(r"ea:(0|[1-9][0-9]{0,8})", item["id"])
++    for tail in SUBRESOURCES[1:]:
++        assert client.get(f"{P}ea:{HAALAND}{tail}").json()["player_id"] == f"ea:{HAALAND}"
+diff --git a/football_intel_backend_phase2/project/tests/test_api/test_player_endpoint.py b/football_intel_backend_phase2/project/tests/test_api/test_player_endpoint.py
+index e049815..6dac563 100644
+--- a/football_intel_backend_phase2/project/tests/test_api/test_player_endpoint.py
++++ b/football_intel_backend_phase2/project/tests/test_api/test_player_endpoint.py
+@@ -128,17 +128,15 @@ def test_percent_encoded_colon_is_the_same_valid_id(client):
+ 
+ 
+ def test_p_uuid_alias_is_never_accepted_and_never_returned(client):
+-    h = profile(client, HAALAND)
+-    uid = h["identity"]["canonical_player_uid"]
++    # the REAL internal uuid is read from the in-memory index (it is internal; since Step 4.7b / G13 it is not in any response)
++    uid = client.app.state.services.runtime.state.index.get(HAALAND).canonical_player_uid
+     assert uid
+     for pid in (f"p:{uid}", uid, f"p%3A{uid}"):
+         r = client.get(P + pid)
+         assert r.status_code == 400 and r.json()["code"] == "INVALID_PLAYER_ID", pid
+-    # `id` is always ea:<n>; the raw uuid appears ONLY in the documented internal field, and no "p:<uuid>" string exists anywhere
+-    h.pop("identity")
+-    assert uid not in json.dumps(h) and not UID_RE.search(json.dumps(h))
+-    search = client.get("/api/v1/players/search?q=haaland&limit=50").text
+-    assert not UID_RE.search(search) and not UID_RE.search(client.get(f"{P}ea:{HAALAND}").text)
++    # `id` is always ea:<n>; the raw uuid appears NOWHERE in a public response and no "p:<uuid>" string exists anywhere
++    for text in (client.get(f"{P}ea:{HAALAND}").text, client.get("/api/v1/players/search?q=haaland&limit=50").text):
++        assert uid not in text and not UID_RE.search(text)
+ 
+ 
+ def test_search_is_not_shadowed_by_the_id_route(client):
+@@ -170,7 +168,7 @@ def test_canonical_profile_haaland(client):
+ 
+ def test_ea_only_profile_nothing_inferred(client):
+     s = profile(client, SALAH)
+-    assert s["identity"]["entity_kind"] == "EA_ONLY" and s["identity"]["canonical_player_uid"] is None
++    assert s["identity"]["entity_kind"] == "EA_ONLY" and set(s["identity"]) == {"entity_kind", "source_ids", "links"}
+     assert s["identity"]["source_ids"] == {"ea_fc26_id": SALAH, "transfermarkt_id": None, "wikidata_id": None}
+     assert s["identity"]["links"]["wikidata"]["status"] == "NOT_EVALUATED" and s["identity"]["links"]["transfermarkt"]["status"] == "UNMATCHED"
+     assert s["values"]["source_market_value"] == {"availability": "NOT_MATCHED", "amount_eur": None, "valuation_date": None, "provenance": None}
+@@ -201,7 +199,7 @@ def test_whole_universe_invariants_via_the_service(client):
+         assert p.provenance[0].source == "ea_fc26" and p.values.ea_ingame_value.provenance == p.provenance[0]
+         assert len({x.source for x in p.provenance}) == len(p.provenance)
+         if r.canonical_player_uid is None:
+-            assert p.identity.entity_kind.value == "EA_ONLY" and p.identity.canonical_player_uid is None and p.image is None
++            assert p.identity.entity_kind.value == "EA_ONLY" and p.image is None
+             assert p.identity.source_ids.transfermarkt_id is None and p.identity.source_ids.wikidata_id is None
+             assert p.values.source_market_value.availability.value == "NOT_MATCHED" and p.injury.status.value == "NOT_EVALUATED"
+             assert [x.source for x in p.provenance] == ["ea_fc26"] and p.meta.contains_sample_data is False
+diff --git a/football_intel_backend_phase2/project/tests/test_api/test_search_endpoint.py b/football_intel_backend_phase2/project/tests/test_api/test_search_endpoint.py
+index b0cb505..f202c3d 100644
+--- a/football_intel_backend_phase2/project/tests/test_api/test_search_endpoint.py
++++ b/football_intel_backend_phase2/project/tests/test_api/test_search_endpoint.py
+@@ -18,7 +18,7 @@ from tests.test_contract.test_search_spec import QUALITY, quality as oracle_qual
+ SEARCH = "/api/v1/players/search"
+ HAALAND, SALAH, VAN_DRONGELEN, VINI = 239085, 209331, 233097, 238794
+ RANK = {q: i for i, q in enumerate(QUALITY)}
+-VOLATILE = {"fetched_at", "checked_at", "generated_at", "canonical_player_uid"}   # uid = random per build (gap G13)
++VOLATILE = {"fetched_at", "checked_at", "generated_at"}   # the random-per-build uid is NOT masked any more: since Step 4.7b (G13) it must not appear at all
+ 
+ 
+ @pytest.fixture(scope="module")
+@@ -248,7 +248,7 @@ def test_canonical_item_blocks(client):
+ def test_ea_only_items_get_nothing_inferred(client):
+     s = ok(client, q="salah", nationality="egypt")
+     item = s["items"][0]
+-    assert item["id"] == f"ea:{SALAH}" and item["identity"]["entity_kind"] == "EA_ONLY" and item["identity"]["canonical_player_uid"] is None
++    assert item["id"] == f"ea:{SALAH}" and item["identity"]["entity_kind"] == "EA_ONLY" and set(item["identity"]) == {"entity_kind", "source_ids", "links"}
+     assert item["identity"]["source_ids"] == {"ea_fc26_id": SALAH, "transfermarkt_id": None, "wikidata_id": None}
+     assert item["identity"]["links"]["transfermarkt"]["status"] == "UNMATCHED" and item["identity"]["links"]["transfermarkt"]["confidence"] is None
+     assert item["identity"]["links"]["wikidata"]["status"] == "NOT_EVALUATED"
+@@ -275,7 +275,7 @@ def test_whole_universe_invariants(client):
+         assert i["values"]["model_estimate"] == {"availability": "NOT_YET_INTEGRATED", "target": "EA_INGAME_VALUE", "amount_eur": None, "model_version": None}
+         assert i["id"] == f"ea:{i['identity']['source_ids']['ea_fc26_id']}"
+         if i["identity"]["entity_kind"] == "EA_ONLY":
+-            assert i["identity"]["canonical_player_uid"] is None and i["image"] is None
++            assert set(i["identity"]) == {"entity_kind", "source_ids", "links"} and i["image"] is None
+             assert i["identity"]["source_ids"]["transfermarkt_id"] is None and i["identity"]["source_ids"]["wikidata_id"] is None
+             assert i["values"]["source_market_value"]["availability"] == "NOT_MATCHED" and i["injury"]["status"] == "NOT_EVALUATED"
+         if i["image"]:
+@@ -422,7 +422,7 @@ def test_source_ids_follow_the_link_status_not_the_canonical_row(db_copy, make_c
+     c = make_client(db_copy)
+     assert c.app.state.services.runtime.state.ok                         # not a startup problem: AMBIGUOUS + canonical is legitimate
+     h = c.get(f"{SEARCH}?q=haaland&entity_kind=CANONICAL").json()["items"][0]
+-    assert h["identity"]["entity_kind"] == "CANONICAL" and h["identity"]["canonical_player_uid"] is not None
++    assert h["identity"]["entity_kind"] == "CANONICAL" and set(h["identity"]) == {"entity_kind", "source_ids", "links"}
+     assert h["identity"]["links"]["transfermarkt"]["status"] == "AMBIGUOUS" and h["identity"]["links"]["transfermarkt"]["confidence"] is None
+     assert h["identity"]["source_ids"]["transfermarkt_id"] is None       # hidden although v_players still knows it
+     assert h["identity"]["source_ids"]["wikidata_id"] == "Q28967995"      # the wikidata link is untouched
+diff --git a/football_intel_backend_phase2/project/tests/test_contract/test_architecture_doc.py b/football_intel_backend_phase2/project/tests/test_contract/test_architecture_doc.py
+index bc694d8..a961e5d 100644
+--- a/football_intel_backend_phase2/project/tests/test_contract/test_architecture_doc.py
++++ b/football_intel_backend_phase2/project/tests/test_contract/test_architecture_doc.py
+@@ -36,7 +36,7 @@ def test_doc_introduces_no_endpoint_outside_the_contract():
+ 
+ 
+ def test_doc_states_the_non_negotiables():
+-    for s in ["read_only=True", "Step 4.1 implemented the foundation", "Step 4.2 implemented `searchPlayers`", "Step 4.3 implemented `getPlayer`", "Step 4.4 implemented `getPlayerMarketValue`", "Step 4.5 implemented `getPlayerInjuries`", "Step 4.6 implemented `getPlayerEaAttributes`", "EA_INGAME_VALUE", "NOT_YET_INTEGRATED", "ea:<id>", "is_live", "SAMPLE_FIXTURE", "fails closed",
++    for s in ["read_only=True", "Step 4.1 implemented the foundation", "Step 4.2 implemented `searchPlayers`", "Step 4.3 implemented `getPlayer`", "Step 4.4 implemented `getPlayerMarketValue`", "Step 4.5 implemented `getPlayerInjuries`", "Step 4.6 implemented `getPlayerEaAttributes`", "Step 4.7b removed `canonical_player_uid` from the public contract", "EA_INGAME_VALUE", "NOT_YET_INTEGRATED", "ea:<id>", "is_live", "SAMPLE_FIXTURE", "fails closed",
+               "Build-then-swap", "contract wins", "no arithmetic between them"]:
+         assert s.lower() in DOC.lower(), s
+     assert "installed in Step 4.1" in DOC and "NOT built" in DOC
+@@ -47,7 +47,7 @@ def test_gap_register_g1_to_g16():
+     assert set(rows) == {f"G{i}" for i in range(1, 17)}
+     assert rows["G1"].startswith("OPEN") and rows["G2"] == "FIXED"
+     assert all(rows[f"G{i}"].startswith("KNOWN") for i in range(3, 9))
+-    assert rows["G9"] == "FIXED" and rows["G10"] == "RESOLVED" and rows["G11"] == "FIXED" and rows["G12"] == "NEW" and rows["G13"] == "DECIDED" and rows["G14"] == "FIXED"
++    assert rows["G9"] == "FIXED" and rows["G10"] == "RESOLVED" and rows["G11"] == "FIXED" and rows["G12"] == "NEW" and rows["G13"] == "RESOLVED" and rows["G14"] == "FIXED"
+     assert rows["G15"].startswith("NEW")                      # Step 4.4: dataset_version tie-break assumption
+     assert rows["G16"].startswith("NEW")                      # Step 4.5: injury contract not ready for a real source
+ 
+diff --git a/football_intel_backend_phase2/project/tests/test_contract/test_endpoint_contract.py b/football_intel_backend_phase2/project/tests/test_contract/test_endpoint_contract.py
+index c2fb025..8cdd5c9 100644
+--- a/football_intel_backend_phase2/project/tests/test_contract/test_endpoint_contract.py
++++ b/football_intel_backend_phase2/project/tests/test_contract/test_endpoint_contract.py
+@@ -147,7 +147,7 @@ def test_example_honesty_invariants(spec):
+     assert '"live:' not in text and "player_face_url" not in text and "sofifa" not in text.lower()
+     for key in ("profile_ea_only_salah", "profile_ea_only_ambiguous"):
+         p = ex[key]
+-        assert p["identity"]["entity_kind"] == "EA_ONLY" and p["identity"]["canonical_player_uid"] is None
++        assert p["identity"]["entity_kind"] == "EA_ONLY" and set(p["identity"]) == {"entity_kind", "source_ids", "links"}
+         assert p["identity"]["source_ids"]["transfermarkt_id"] is None and p["identity"]["source_ids"]["wikidata_id"] is None
+         assert p["values"]["source_market_value"] == {"availability": "NOT_MATCHED", "amount_eur": None, "valuation_date": None, "provenance": None}
+         assert p["injury"]["status"] == "NOT_EVALUATED" and p["image"] is None

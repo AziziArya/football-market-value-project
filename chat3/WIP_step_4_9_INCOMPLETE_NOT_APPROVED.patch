@@ -1,0 +1,570 @@
+diff --git a/football_intel_backend_phase2/project/ARCHITECTURE_API.md b/football_intel_backend_phase2/project/ARCHITECTURE_API.md
+index 694adb4..1547fb1 100644
+--- a/football_intel_backend_phase2/project/ARCHITECTURE_API.md
++++ b/football_intel_backend_phase2/project/ARCHITECTURE_API.md
+@@ -1,6 +1,6 @@
+ # ARCHITECTURE_API - API service architecture (Step 3.3 design, Step 4.1 foundation built)
+ 
+-Status: **Step 4.1 implemented the foundation** (package `api/`, `getHealth`, `getDataFreshness`, RM1/RM2 + startup invariants), **Step 4.2 implemented `searchPlayers`** (RM3 aliases, search index, batch enrichment) and **Step 4.3 implemented `getPlayer`** and **Step 4.4 implemented `getPlayerMarketValue`** and **Step 4.5 implemented `getPlayerInjuries`** and **Step 4.6 implemented `getPlayerEaAttributes`**; **Step 4.7b removed `canonical_player_uid` from the public contract (G13, contract 0.5.0-draft)** and **Step 4.8 implemented `getPlayerLineage`** (every contract endpoint is now served). Everything else below is still design: ML and G1 are NOT built.
++Status: **Step 4.1 implemented the foundation** (package `api/`, `getHealth`, `getDataFreshness`, RM1/RM2 + startup invariants), **Step 4.2 implemented `searchPlayers`** (RM3 aliases, search index, batch enrichment) and **Step 4.3 implemented `getPlayer`** and **Step 4.4 implemented `getPlayerMarketValue`** and **Step 4.5 implemented `getPlayerInjuries`** and **Step 4.6 implemented `getPlayerEaAttributes`**; **Step 4.7b removed `canonical_player_uid` from the public contract (G13, contract 0.5.0-draft)** and **Step 4.8 implemented `getPlayerLineage`** (every contract endpoint is now served); **Step 4.9 added the integration and contract-consistency suite (no new endpoint, no behaviour change)**. Everything else below is still design: ML and G1 are NOT built.
+ Inputs: the real repository, `api_contract/openapi.json` (Steps 3.1/3.2, 8 GET endpoints) and measurements taken on the real
+ 16,107-player database (section 13). If this document and `openapi.json` disagree, **the contract wins**.
+ 
+@@ -156,6 +156,16 @@ EA-only vs canonical: both are searchable; aliases exist only for canonical play
+ - States: EA-only -> 200, identity `EA_ONLY` with its real link statuses, and the six EA fields (one `ea_fc26` value each; nothing from Transfermarkt/Wikidata); the AMBIGUOUS EA-only player (Van Drongelen) -> the same, with the TM link `AMBIGUOUS`, `confidence`/`matched_on` null, no TM id and none of the candidate's (Mbappe's) values. Canonical -> EA fields + the linked sources' fields. Real data: 5 canonical players (EA + Transfermarkt, Haaland also 3 Wikidata fields) and 16,102 EA-only players, `preferred_foot` exists for everyone (EA only).
+ - `meta.contains_sample_data`: true when a shown value comes from a sample source OR a shown id comes from a MATCHED/PROBABLE link against a sample (same rule as `getPlayer`; shared helper `identity_shows_sample_data`).
+ - Contract example `lineage_vini`: the response equals it plus the field `preferred_foot` (EA only), which the example omits; see G17.
++
++### 6.8 Step 4.9: integration and contract-consistency check (no new behaviour)
++- Scope: verify the 8 endpoints against the contract AS A WHOLE and against each other. New suite `tests/test_api/test_integration_consistency.py` (39 tests, real 16,107-player database). Non-goals: any new endpoint or field, a contract version change, G17, G12, ML, G1, real data, frontend.
++- **Generated OpenAPI vs contract (found and fixed, documentation only, `api/app.py` + `api/schemas/common.py`):** (1) every operation advertised a framework-generated `422` and the schemas `HTTPValidationError` / `ValidationError`; a 422 can never be returned (validation errors are mapped to 400 `INVALID_PARAMETER`) and the contract has none; removed. (2) all 27 error responses were declared `application/json` although the server returns, and the contract declares, `application/problem+json`; fixed. (3) `Problem.code` was a free `string`; it is now the contract's closed `ProblemCode` enum (same JSON on the wire). Runtime behaviour is unchanged. (4) The contract text said "implemented so far: ... getPlayer; every other operation is still contract-only" and "planned base path"; both were stale since Step 4.4 and were corrected (text only, version unchanged).
++- Now pinned as a whole: same paths, methods and operation ids; the exact response-code set of every operation (8 x 200 + 27 errors); every parameter of every operation (name, location, required, type, bounds, enum, default); every shared schema (property names, required, enums) with the naming differences listed explicitly (contract-only `PlayerCore`, `PlayerId`, `PlayerSummary`, `SearchMatchQuality`; generated-only `Links`, `MatchQuality`, `SearchSort`), so any new drift fails.
++- **Cross-endpoint consistency** (127 players: the 7 samples + 120 random): the same player has the same id, identity block, EA value, ratings, preferred foot and provenance everywhere; the latest market value of the profile is the latest point of the history; the injury block is identical in profile and injuries; the profile's display name, club, nationality, position, date of birth and preferred foot are exactly the EA values listed by lineage; every search item equals its profile; `meta.contains_sample_data` equals what each response really shows; every `meta` carries `0.5.0-draft` and a UTC-second timestamp; the state matrix canonical / EA-only / AMBIGUOUS is the contract's vocabulary.
++- **Leakage sweep:** 20 hostile player ids x 5 routes (SQL, script, traversal, CRLF, NUL, unicode digits, 5,000 characters, uuid forms, template syntax) are 400/404 and never reflected; hostile search input is only echoed as `query_normalized` (lower-case ASCII letters and digits, single spaces, at most 80 characters); every error body is free of paths, SQL, stack traces and internal names; no internal identifier in any success response; shared-helper failures are 500 problems on exactly the routes that use the helper; the only response headers are `content-type` and `content-length` (no server banner, cookie, CORS or debug header by default); docs / openapi are off by default; every route answers 405 with `Allow: GET` to POST/PUT/DELETE/PATCH.
++- **Query budget (pinned maxima, an N+1 fails):** health 1, data-freshness 6, search 3 (independent of the number of items), getPlayer 4 (canonical) / 0 (EA-only), market value 1 / 0, injuries 1 / 0, EA attributes 0, lineage 1, errors 0.
++- **Read-only and determinism for the whole API:** two sweeps of every route for 7+ players, searches, health and freshness are equal apart from timestamps, and the database file is byte- and mtime-identical afterwards with no WAL or temp file beside it.
++- **Observed and NOT changed (owner decisions, see G18, G19 and KNOWN_ISSUES #24-#26):** unknown routes, 405, and ids that contain a `/` get the framework default `application/json` `{"detail": ...}`; unknown search parameter names are echoed unbounded in `errors[].parameter`; extra query parameters are ignored on every endpoint except search; a trailing slash redirects (307); HEAD and OPTIONS are 405 (relevant for CORS before a frontend exists).
+ ## 7. Service rules: provenance, freshness, value separation
+ - `domain/source_registry`: `ea_fc26 -> REAL_FULL`; `transfermarkt_dataset -> SAMPLE_FIXTURE`; `wikidata -> SAMPLE_FIXTURE`; unknown source -> `UNKNOWN` (never REAL). It is changed deliberately when real data arrives; `dataset_version` text is never parsed for origin.
+ - `is_live` is the constant false until a provider with a real endpoint exists. `meta.generated_at` is response time; data age comes only from provenance.
+@@ -222,8 +232,10 @@ Names: 314 non-ASCII after NFKD only, 0 after the spec; 124 duplicate names (128
+ | G15 | NEW (Step 4.4) | `dataset_version` is an opaque text label; `latest` for two points on the SAME date relies on text ordering of the version (as the contract and `getPlayer` already do). Only the sample version exists today, so it cannot matter yet | when a second real dataset version is loaded, decide a comparable version scheme (or use `imported_at`) before relying on this tie-break |
+ | G16 | NEW (Step 4.5) | `InjuryRecord` has no per-record provenance (`data_origin`, `dataset_version`, `imported_at`) and the contract defines no record order; `HAS_RECORDS` is not required to have rows; `injury_records` has no logical key. All moot today (no source, no rows) | before ANY injury source is integrated: add record provenance to the contract (new contract version), define the order and the HAS_RECORDS <=> rows rule, add `injury` to the source registry. Until then the endpoint reports a stored `HAS_RECORDS` with no rows as stored (`records: []`) |
+ | G17 | NEW (Step 4.8) | the contract example `lineage_vini` lists 5 of the 6 EA fields (the database also holds `preferred_foot`, shown for everyone) and its summary says the sources disagree on `display_name/club` although the club is identical in both sources (they disagree on `display_name` and `position`). The behaviour follows the documented rule (all stored fields, one entry per source), not the example | owner decision: correct the example (and its summary) in the next contract version, or declare a field allow-list; no code change is needed either way |
++| G18 | NEW (Step 4.9) | the contract's `ProblemCode` has no code for "unknown route" or "method not allowed": unknown routes, ids containing `/` (404) and write methods (405) are answered by the framework as `application/json` `{"detail": ...}`, not RFC 9457 `problem+json`; the contract defines no 404/405 for them | owner decision: add codes (e.g. a not-found and a method-not-allowed code) and map the framework errors to `Problem` in a new contract version, or declare them out of contract. Write methods are already 405 with `Allow: GET` (tested), nothing leaks |
++| G19 | NEW (Step 4.9) | an unknown search parameter NAME is echoed in `errors[].parameter` (contract example `problem_unknown_search_parameter`), without a length cap and one error per name (a 5,000-character name gives a 5 KB response, 300 names give 300 errors); the value is never echoed; response size is about the request size, so it is not an amplification | owner decision (hardening): cap the echoed name length and the number of errors. Not a leak |
+ 
+-## 15. Implementation status (Steps 4.1-4.6, 4.7b, 4.8) and what remains
++## 15. Implementation status (Steps 4.1-4.6, 4.7b, 4.8, 4.9) and what remains
+ Built: `api/` (config, errors, domain: enums/models/normalize/source registry/link rules/player index/**search**; readmodels: SQL definitions incl. RM3 and batch enrichment; repositories: read-only DuckDB, catalog, RM1/RM2/RM3, freshness, **player_detail**; services: integrity, health, freshness, **player_summary, search**; schemas incl. **player/search**; routers; `create_app`). Run: `uvicorn api.app:create_app --factory`.
+ Implemented endpoints: `getHealth`, `getDataFreshness`, `searchPlayers`, `getPlayer`, `getPlayerMarketValue`, `getPlayerInjuries`, `getPlayerEaAttributes`, `getPlayerLineage` (every endpoint of the contract). Not built: `/admin/*`, auth, ML, frontend.
+ Decisions taken so far:
+diff --git a/football_intel_backend_phase2/project/api/app.py b/football_intel_backend_phase2/project/api/app.py
+index 5794710..dd5b35d 100644
+--- a/football_intel_backend_phase2/project/api/app.py
++++ b/football_intel_backend_phase2/project/api/app.py
+@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager
+ from fastapi import FastAPI, Request
+ from fastapi.exceptions import RequestValidationError
+ from fastapi.middleware.cors import CORSMiddleware
++from fastapi.openapi.utils import get_openapi
+ from fastapi.responses import JSONResponse
+ 
+ from api import API_BASE_PATH, CONTRACT_VERSION
+@@ -96,4 +97,23 @@ def create_app(config: ApiConfig | None = None) -> FastAPI:
+     app.include_router(freshness.router, prefix=API_BASE_PATH)
+     app.include_router(search.router, prefix=API_BASE_PATH)    # before /players/{player_id}: "search" is not an id
+     app.include_router(player.router, prefix=API_BASE_PATH)
++
++    def contract_openapi() -> dict:
++        """The generated OpenAPI aligned with the contract, documentation only (no runtime behaviour changes):
++        - minus the framework's automatic 422: request validation errors are mapped to 400 INVALID_PARAMETER above, so a 422 can never be returned and
++          the contract does not define it;
++        - every error response is declared `application/problem+json` (what is really returned and what the contract says), not `application/json`."""
++        if app.openapi_schema is None:
++            schema = get_openapi(title=app.title, version=app.version, routes=app.routes)
++            for path_item in schema.get("paths", {}).values():
++                for operation in path_item.values():
++                    operation.get("responses", {}).pop("422", None)
++                    for status, response in operation.get("responses", {}).items():
++                        if status != "200" and "application/json" in response.get("content", {}):
++                            response["content"] = {PROBLEM_MEDIA_TYPE: response["content"]["application/json"]}
++            for name in ("HTTPValidationError", "ValidationError"):
++                schema.get("components", {}).get("schemas", {}).pop(name, None)
++            app.openapi_schema = schema
++        return app.openapi_schema
++    app.openapi = contract_openapi
+     return app
+diff --git a/football_intel_backend_phase2/project/api/schemas/common.py b/football_intel_backend_phase2/project/api/schemas/common.py
+index db84c71..2283d17 100644
+--- a/football_intel_backend_phase2/project/api/schemas/common.py
++++ b/football_intel_backend_phase2/project/api/schemas/common.py
+@@ -5,6 +5,8 @@ from datetime import datetime
+ 
+ from pydantic import BaseModel, ConfigDict
+ 
++from api.domain.enums import ProblemCode
++
+ 
+ class ResponseMeta(BaseModel):
+     model_config = ConfigDict(extra="forbid")
+@@ -25,7 +27,7 @@ class Problem(BaseModel):
+     type: str
+     title: str
+     status: int
+-    code: str
++    code: ProblemCode                       # the contract's closed set of codes (was a free `str`: the generated spec was weaker than the contract)
+     detail: str | None = None
+     instance: str | None = None
+     errors: list[ProblemError] | None = None
+diff --git a/football_intel_backend_phase2/project/api_contract/openapi.json b/football_intel_backend_phase2/project/api_contract/openapi.json
+index 33e1431..e344aa5 100644
+--- a/football_intel_backend_phase2/project/api_contract/openapi.json
++++ b/football_intel_backend_phase2/project/api_contract/openapi.json
+@@ -3,7 +3,7 @@
+   "info": {
+     "title": "Football Player Intelligence API - contract",
+     "version": "0.5.0-draft",
+-    "description": "CONTRACT - Implemented so far: getHealth, getDataFreshness (Step 4.1) searchPlayers (Step 4.2) and getPlayer (Step 4.3); every other operation is still contract-only. Step 3.1 (identity/provenance) + Step 3.2 (paths). Every leaf property has x-source (real table/column) or x-derived (rule). x-status: IMPLEMENTABLE_TODAY = producible from the current DB; SCHEMA_ONLY = table exists but is empty; PLANNED = not produced yet, always nullable/availability-tagged. Examples were generated from a local sandbox run of the real pipeline (16,107 EA players + the two sample fixtures); timestamps belong to that run."
++    "description": "CONTRACT - every operation below is implemented: getHealth and getDataFreshness (Step 4.1), searchPlayers (4.2), getPlayer (4.3), getPlayerMarketValue (4.4), getPlayerInjuries (4.5), getPlayerEaAttributes (4.6), getPlayerLineage (4.8). Step 3.1 (identity/provenance) + Step 3.2 (paths). Every leaf property has x-source (real table/column) or x-derived (rule). x-status: IMPLEMENTABLE_TODAY = producible from the current DB; SCHEMA_ONLY = table exists but is empty; PLANNED = not produced yet, always nullable/availability-tagged. Examples were generated from a local sandbox run of the real pipeline (16,107 EA players + the two sample fixtures); timestamps belong to that run."
+   },
+   "paths": {
+     "/health": {
+@@ -2782,7 +2782,7 @@
+   "servers": [
+     {
+       "url": "/api/v1",
+-      "description": "planned base path"
++      "description": "base path of the implemented API"
+     }
+   ]
+ }
+diff --git a/football_intel_backend_phase2/project/tests/test_api/test_integration_consistency.py b/football_intel_backend_phase2/project/tests/test_api/test_integration_consistency.py
+new file mode 100644
+index 0000000..080a99e
+--- /dev/null
++++ b/football_intel_backend_phase2/project/tests/test_api/test_integration_consistency.py
+@@ -0,0 +1,443 @@
++"""Step 4.9 - backend integration and contract-consistency suite. NO new behaviour is tested here: this module checks that the 8 endpoints agree
++with the contract AS A WHOLE (not endpoint by endpoint), with each other (the same player seen through every endpoint), that nothing internal leaks
++through any success or error path, that the query cost of every endpoint stays within a pinned budget, and that serving never modifies the database."""
++import hashlib
++import json
++import logging
++import os
++import random
++import re
++import shutil
++
++import pytest
++from fastapi.testclient import TestClient
++
++from api import CONTRACT_VERSION
++from api.app import create_app
++from api.config import ApiConfig
++from tests.test_api.test_search_endpoint import count_queries, mask
++
++P = "/api/v1/players/"
++HAALAND, SALAH, VAN_DRONGELEN, VINI, MBAPPE, SAKA, BELLINGHAM = 239085, 209331, 233097, 238794, 231747, 246669, 252371
++CANONICAL = (MBAPPE, VINI, HAALAND, SAKA, BELLINGHAM)
++SAMPLE = (*CANONICAL, SALAH, VAN_DRONGELEN)
++PLAYER_ROUTES = ("", "/market-value", "/injuries", "/ea-attributes", "/lineage")
++UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
++GENERATED_AT_RE = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ")
++# Names that legitimately differ between the hand-written contract and the generated spec (naming / inlining only, no structural difference):
++CONTRACT_ONLY_SCHEMAS = {"PlayerCore", "PlayerId", "PlayerSummary", "SearchMatchQuality"}                  # abstract bases / inlined by the generator
++GENERATED_ONLY_SCHEMAS = {"Links", "MatchQuality", "SearchSort"}                                           # the generator's names for inline contract objects / enums
++
++
++@pytest.fixture(scope="module")
++def client(full_db):
++    logging.getLogger("api").setLevel(logging.CRITICAL)
++    with TestClient(create_app(ApiConfig(db_path=full_db)), raise_server_exceptions=False) as c:
++        yield c
++
++
++@pytest.fixture(scope="module")
++def generated(full_db):
++    with TestClient(create_app(ApiConfig(db_path=full_db, enable_docs=True))) as c:
++        return c.get("/openapi.json").json()
++
++
++@pytest.fixture(scope="module")
++def population(client):
++    """The 7 sample players + 120 random players (EA-only), as ids."""
++    index = client.app.state.services.runtime.state.index
++    ea_only = [r.ea_fc26_id for r in index.rows if r.canonical_player_uid is None and r.ea_fc26_id not in SAMPLE]
++    return [*SAMPLE, *random.Random(49).sample(ea_only, 120)]
++
++
++def get_all(client, ea_id):
++    return {tail or "profile": client.get(f"{P}ea:{ea_id}{tail}") for tail in PLAYER_ROUTES}
++
++
++# ---------------------------------------------------------------------------------------------- 1. the generated spec vs the contract, as a whole
++def resolve(spec, node):
++    while isinstance(node, dict) and "$ref" in node:
++        target = spec
++        for part in node["$ref"].lstrip("#/").split("/"):
++            target = target[part]
++        node = {**target, **{k: v for k, v in node.items() if k != "$ref"}}                  # siblings of a $ref (e.g. a default) override
++    return node
++
++
++def effective(spec, schema):
++    """The constraints that matter to a client, ignoring titles/descriptions and the generator's `anyOf [X, null]` wrapping of optional parameters."""
++    schema = resolve(spec, schema)
++    if "anyOf" in schema:
++        branches = [effective(spec, b) for b in schema["anyOf"] if b.get("type") != "null"]
++        assert len(branches) == 1
++        return {**branches[0], **{k: v for k, v in schema.items() if k in ("default",)}}
++    return {k: v for k, v in schema.items() if k in ("type", "minLength", "maxLength", "minimum", "maximum", "enum", "default", "pattern")}
++
++
++def flat_schema(spec, schema):
++    """(property names, required names, enum) of a schema with $ref and allOf flattened."""
++    schema = resolve(spec, schema)
++    props, required = set(schema.get("properties", {})), set(schema.get("required", []))
++    for part in schema.get("allOf", []):
++        p, r, _ = flat_schema(spec, part)
++        props |= p
++        required |= r
++    return props, required, schema.get("enum")
++
++
++def test_generated_spec_has_no_422_no_validation_schemas_and_no_dangling_refs(generated):
++    """FastAPI adds a 422 + HTTPValidationError to every operation by default; here request validation errors are mapped to 400 INVALID_PARAMETER, so a
++    422 can never be returned and the contract does not define it. (Fixed in Step 4.9.)"""
++    text = json.dumps(generated)
++    assert '"422"' not in text and "ValidationError" not in text
++    refs = set(re.findall(r'"\$ref": "#/components/schemas/([^"]+)"', text))
++    assert refs <= set(generated["components"]["schemas"])
++
++
++def test_paths_methods_and_operation_ids_equal_the_contract(generated, contract):
++    assert {p.removeprefix("/api/v1"): {m: o["operationId"] for m, o in v.items()} for p, v in generated["paths"].items()} == \
++           {p: {m: o["operationId"] for m, o in v.items()} for p, v in contract["paths"].items()}
++
++
++def test_every_operation_declares_exactly_the_contract_response_codes(generated, contract):
++    for path, item in contract["paths"].items():
++        want = set(item["get"]["responses"])
++        assert set(generated["paths"]["/api/v1" + path]["get"]["responses"]) == want, path
++        assert want <= {"200", "400", "404", "500", "503"}                                    # the contract defines no other status
++
++
++def test_every_response_has_the_contract_media_type_and_the_error_ones_are_the_problem_schema(generated, contract):
++    """The contract declares application/problem+json for every error response; the generator used to declare application/json (Fixed in Step 4.9)."""
++    checked = 0
++    for path, item in contract["paths"].items():
++        for code, response in item["get"]["responses"].items():
++            want = resolve(contract, response)
++            have = generated["paths"]["/api/v1" + path]["get"]["responses"][code]
++            assert set(have["content"]) == set(want["content"]), (path, code)
++            if code != "200":
++                assert set(have["content"]) == {"application/problem+json"}
++                assert resolve(generated, have["content"]["application/problem+json"]["schema"]) == resolve(generated, {"$ref": "#/components/schemas/Problem"}), (path, code)
++            checked += 1
++    assert checked == 8 + 27                                                                     # 8 x 200 and 27 error responses (health 2, freshness 2, search 3, 5 player routes x 4)
++
++
++def test_what_the_server_returns_is_what_the_spec_declares(client):
++    for url, status in ((f"{P}ea:{HAALAND}", 200), (f"{P}ea:1", 404), (f"{P}p:abc", 400), (f"{P}search?q=a", 400)):
++        response = client.get(url)
++        assert response.status_code == status
++        assert response.headers["content-type"] == ("application/json" if status == 200 else "application/problem+json")
++
++
++def test_every_parameter_of_every_operation_matches_the_contract(generated, contract):
++    for path, item in contract["paths"].items():
++        want = {p["name"]: p for p in (resolve(contract, x) for x in item["get"].get("parameters", []))}
++        have = {p["name"]: p for p in generated["paths"]["/api/v1" + path]["get"].get("parameters", [])}
++        assert set(have) == set(want), path
++        for name, w in want.items():
++            h = have[name]
++            assert h["in"] == w["in"] and bool(h.get("required")) == bool(w.get("required")), (path, name)
++            assert effective(generated, h["schema"]) == effective(contract, w["schema"]), (path, name)
++
++
++def test_every_contract_schema_has_a_structural_counterpart_in_the_generated_spec(generated, contract):
++    cs, gs = contract["components"]["schemas"], generated["components"]["schemas"]
++    assert set(cs) - set(gs) == CONTRACT_ONLY_SCHEMAS and set(gs) - set(cs) == GENERATED_ONLY_SCHEMAS         # any new naming drift fails here
++    for name in sorted(set(cs) & set(gs)):
++        cp, cr, ce = flat_schema(contract, cs[name])
++        gp, gr, ge = flat_schema(generated, gs[name])
++        assert cp == gp, (name, sorted(cp ^ gp))
++        assert cr <= gr, (name, sorted(cr - gr))
++        assert ce == ge, name
++    assert flat_schema(contract, cs["SearchMatchQuality"])[2] == flat_schema(generated, gs["MatchQuality"])[2]
++    assert flat_schema(generated, gs["ProblemCode"])[2] == ["INVALID_PARAMETER", "INVALID_PLAYER_ID", "PLAYER_NOT_FOUND", "DATA_UNAVAILABLE", "INTERNAL_ERROR"]
++    assert resolve(generated, gs["Problem"]["properties"]["code"]) == resolve(generated, {"$ref": "#/components/schemas/ProblemCode"})      # `code` is the closed set (Step 4.9)
++    assert flat_schema(contract, cs["Identity"]["properties"]["links"])[0] == flat_schema(generated, gs["Links"])[0] == {"transfermarkt", "wikidata"}
++    assert flat_schema(contract, cs["PlayerSummary"])[0] == flat_schema(generated, gs["SearchItem"])[0] - {"match"}
++
++
++def test_the_contract_text_no_longer_claims_endpoints_are_unbuilt(contract):
++    assert "contract-only" not in contract["info"]["description"].lower() and "planned base path" not in json.dumps(contract["servers"]).lower()
++    assert contract["servers"][0]["description"] == "base path of the implemented API"
++    assert contract["info"]["description"].startswith("CONTRACT - every operation below is implemented")
++    for operation_id in ("getHealth", "getDataFreshness", "searchPlayers", "getPlayer", "getPlayerMarketValue", "getPlayerInjuries",
++                         "getPlayerEaAttributes", "getPlayerLineage"):
++        assert operation_id in contract["info"]["description"]
++
++
++# ---------------------------------------------------------------------------------------------- 2. the same player through every endpoint
++def test_every_response_conforms_to_its_contract_schema(client, population, validate):
++    schemas = {"profile": "PlayerProfile", "/market-value": "MarketValueResponse", "/injuries": "InjuriesResponse",
++               "/ea-attributes": "EaAttributesResponse", "/lineage": "LineageResponse"}
++    for ea_id in population[:60]:
++        for route, response in get_all(client, ea_id).items():
++            assert response.status_code == 200 and response.headers["content-type"] == "application/json", (ea_id, route)
++            validate(schemas[route], response.json())
++
++
++def test_one_player_is_the_same_player_everywhere(client, population):
++    for ea_id in population:
++        r = get_all(client, ea_id)
++        prof, mv, inj, ea, lin = (r[k].json() for k in ("profile", "/market-value", "/injuries", "/ea-attributes", "/lineage"))
++        public_id = f"ea:{ea_id}"
++        assert prof["id"] == mv["player_id"] == inj["player_id"] == ea["player_id"] == lin["player_id"] == public_id
++        assert prof["identity"] == lin["identity"]                                                       # one identity block, three endpoints
++        kind = prof["identity"]["entity_kind"]
++        assert inj["injury"] == prof["injury"]
++        assert ea["ea_ingame_value"] == prof["values"]["ea_ingame_value"]
++        assert (ea["overall_rating"], ea["potential"], ea["preferred_foot"]) == (prof["overall_rating"], prof["potential"], prof["preferred_foot"])
++        assert ea["provenance"] == prof["provenance"][0] and prof["provenance"][0]["source"] == "ea_fc26"
++        if kind == "CANONICAL":
++            assert mv["availability"] == "AVAILABLE" and mv["latest"] is not None
++            smv = prof["values"]["source_market_value"]
++            assert (smv["amount_eur"], smv["valuation_date"]) == (mv["latest"]["amount_eur"], mv["latest"]["valuation_date"])
++            assert smv["provenance"]["dataset_version"] == mv["latest"]["dataset_version"]
++            assert inj["injury"]["status"] == "NO_SOURCE_AVAILABLE" and inj["records"] == []
++        else:
++            assert mv == {**mv, "availability": "NOT_MATCHED", "points": [], "latest": None}
++            assert prof["values"]["source_market_value"]["availability"] == "NOT_MATCHED"
++            assert inj["injury"] == {"status": "NOT_EVALUATED", "checked_at": None}
++            assert {v["source"] for f in lin["fields"] for v in f["values"]} == {"ea_fc26"}
++        assert prof["values"]["model_estimate"] == {"availability": "NOT_YET_INTEGRATED", "target": "EA_INGAME_VALUE", "amount_eur": None, "model_version": None}
++        assert ea["detailed_attributes"]["availability"] == "NOT_YET_INTEGRATED"
++
++
++def test_every_profile_field_is_traceable_to_the_lineage(client, population):
++    """display_name, club, nationality, position, date_of_birth and preferred_foot of the profile are the EA values that lineage lists (and the EA
++    values of the profile never come from another source)."""
++    for ea_id in population:
++        r = get_all(client, ea_id)
++        prof, lin = r["profile"].json(), r["/lineage"].json()
++        ea_values = {f["field_name"]: [v["field_value"] for v in f["values"] if v["source"] == "ea_fc26"] for f in lin["fields"]}
++        for field in ("display_name", "club", "nationality", "position", "date_of_birth", "preferred_foot"):
++            assert ea_values[field] == [prof[field]], (ea_id, field)
++
++
++def test_search_items_equal_the_profiles(client):
++    for q in ("haaland", "vinicius", "salah", "van drongelen", "bellingham", "mbappe", "saka"):
++        for item in client.get(f"{P}search?q={q}&limit=50").json()["items"]:
++            prof = client.get(P + item["id"]).json()
++            assert {k: v for k, v in item.items() if k != "match"} == {k: prof[k] for k in item if k != "match"}, item["id"]
++
++
++def test_the_sample_flag_matches_what_each_response_really_shows(client, population):
++    from api.domain.source_registry import origin_for
++
++    def link_shows_sample(identity):
++        return any(l["status"] in ("MATCHED", "PROBABLE_MATCH") and l["reference_data_origin"] == "SAMPLE_FIXTURE" for l in identity["links"].values())
++
++    for ea_id in population:
++        r = get_all(client, ea_id)
++        prof, mv, inj, ea, lin = (r[k].json() for k in ("profile", "/market-value", "/injuries", "/ea-attributes", "/lineage"))
++        smv = prof["values"]["source_market_value"]["provenance"]
++        profile_shows = (smv is not None and smv["data_origin"] == "SAMPLE_FIXTURE") or (prof["image"] is not None and origin_for(prof["image"]["source"]).value == "SAMPLE_FIXTURE") \
++            or link_shows_sample(prof["identity"])
++        assert prof["meta"]["contains_sample_data"] is profile_shows, ea_id
++        assert mv["meta"]["contains_sample_data"] is any(p["data_origin"] == "SAMPLE_FIXTURE" for p in mv["points"])
++        assert inj["meta"]["contains_sample_data"] is False and ea["meta"]["contains_sample_data"] is False
++        assert lin["meta"]["contains_sample_data"] is (any(v["data_origin"] == "SAMPLE_FIXTURE" for f in lin["fields"] for v in f["values"]) or link_shows_sample(lin["identity"]))
++
++
++def test_every_meta_block_carries_the_contract_version_and_a_utc_second_timestamp(client, population):
++    for ea_id in population[:40]:
++        for route, response in get_all(client, ea_id).items():
++            meta = response.json()["meta"]
++            assert meta["contract_version"] == CONTRACT_VERSION == "0.5.0-draft" and GENERATED_AT_RE.fullmatch(meta["generated_at"]), (ea_id, route)
++    assert client.get("/api/v1/health").json()["contract_version"] == CONTRACT_VERSION
++    assert client.get("/api/v1/data-freshness").json()["meta"]["contract_version"] == CONTRACT_VERSION
++    assert client.get(f"{P}search?q=haaland").json()["meta"]["contract_version"] == CONTRACT_VERSION
++
++
++def test_state_matrix_of_the_three_kinds_of_player(client):
++    """canonical / EA-only / AMBIGUOUS through all five player routes: the availability vocabulary is the contract's, nothing is invented."""
++    expected = {
++        HAALAND:       ("CANONICAL", "AVAILABLE",   "NO_SOURCE_AVAILABLE", 3, 14),
++        SALAH:         ("EA_ONLY",   "NOT_MATCHED", "NOT_EVALUATED",       0, 6),
++        VAN_DRONGELEN: ("EA_ONLY",   "NOT_MATCHED", "NOT_EVALUATED",       0, 6),
++    }
++    for ea_id, (kind, mv_state, inj_state, points, lineage_values) in expected.items():
++        r = get_all(client, ea_id)
++        assert r["profile"].json()["identity"]["entity_kind"] == kind
++        assert r["/market-value"].json()["availability"] == mv_state and len(r["/market-value"].json()["points"]) == points
++        assert r["/injuries"].json()["injury"]["status"] == inj_state
++        assert r["/ea-attributes"].json()["ea_ingame_value"]["availability"] == "AVAILABLE"
++        assert sum(len(f["values"]) for f in r["/lineage"].json()["fields"]) == lineage_values
++    assert client.get(f"{P}ea:{VAN_DRONGELEN}").json()["identity"]["links"]["transfermarkt"]["status"] == "AMBIGUOUS"
++
++
++# ---------------------------------------------------------------------------------------------- 3. leakage / security sweep
++ERROR_BODY_FORBIDDEN = [re.compile(p, re.I) for p in (
++    r"traceback", r"file \"", r"site-packages", r"\.py\b", r"\.duckdb", r"/home/", r"/tmp/", r"/mnt/", r"duckdb", r"\bselect\b.*\bfrom\b", r"\binsert\b",
++    r"football_intel", r"canonical_player_uid", r"player_uid", r"source_record_id", r"password", r"secret", r"token", r"exception", r"\bat 0x")]
++
++
++def assert_clean_error(response, hostile=()):
++    """For ERROR bodies (the words below could legitimately occur in a club or a player name of a SUCCESS body, so those only get the structural check)."""
++    text = response.text
++    if response.status_code >= 400:
++        for pattern in ERROR_BODY_FORBIDDEN:
++            assert not pattern.search(text), (pattern.pattern, text[:200])
++    for structural in (r"canonical_player_uid", r"player_uid", r"source_record_id", r"\.duckdb", r"/home/", r"/mnt/", r"traceback"):
++        assert not re.search(structural, text, re.I), structural
++    assert not UUID_RE.search(text)
++    for fragment in hostile:
++        assert fragment not in text, fragment
++
++
++HOSTILE_IDS = {
++    "sql": "ea:1'%20OR%201=1--", "sql2": "ea:1;DROP%20TABLE%20players", "script": "%3Cscript%3Ealert(1)%3C/script%3E", "traversal": "..%2F..%2Fetc%2Fpasswd",
++    "traversal2": "....//....//etc/passwd", "crlf": "ea:1%0d%0aX-Evil:1", "null byte": "ea:1%00", "unicode digit": "ea:%EF%BC%91", "long": "ea:" + "9" * 5000,
++    "uuid": "p:3943921e-6d70-4677-acb2-bceb4988cf07", "bare uuid": "3943921e-6d70-4677-acb2-bceb4988cf07", "leading zero": "ea:01", "empty number": "ea:",
++    "uppercase": "EA:1", "plus": "ea:+1", "space": "ea:%201", "hex": "ea:0x1", "float": "ea:1.5", "negative": "ea:-1", "template": "ea:%7B%7B7*7%7D%7D",
++}
++HOSTILE_FRAGMENTS = ("OR 1=1", "DROP", "<script", "passwd", "X-Evil", "9" * 20, "3943921e", "7*7", "0x1")
++
++
++@pytest.mark.parametrize("route", PLAYER_ROUTES)
++def test_hostile_player_ids_never_reach_a_response_body(client, route):
++    statuses = []
++    for label, hostile in HOSTILE_IDS.items():
++        response = client.get(f"{P}{hostile}{route}")
++        statuses.append(response.status_code)
++        assert response.status_code in (400, 404), (label, response.status_code)
++        assert_clean_error(response, HOSTILE_FRAGMENTS)
++        if response.status_code == 400:
++            assert response.headers["content-type"] == "application/problem+json" and response.json()["code"] == "INVALID_PLAYER_ID" and response.json()["instance"] is None, label
++    assert statuses.count(400) >= 14 and set(statuses) <= {400, 404}                              # the control: most of them really are rejected as ids, not just 404
++
++
++def test_hostile_search_input_is_only_echoed_in_its_normalised_form(client, validate):
++    """The contract echoes `query_normalized` (lower-case ASCII letters and digits, single spaces, at most 80 characters): nothing else of `q` is reflected."""
++    for label, qs in {"sql": "q=ab'%20OR%201=1--", "script": "q=%3Cscript%3Ealert(1)%3C/script%3E", "null": "q=ab%00cd", "newline": "q=ab%0acd", "unicode": "q=%C3%A9%C3%A9%F0%9F%98%80",
++                      "long": "q=" + "a" * 5000, "club": "q=ab&club=%27%3BDROP%20TABLE%20players--", "bad limit": "q=ab&limit=%3Cscript%3E", "bad sort": "q=ab&sort=%3Cb%3E",
++                      "bad kind": "q=ab&entity_kind=%3Cb%3E", "bad min": "q=ab&min_overall=1e9"}.items():
++        response = client.get(f"{P}search?{qs}")
++        assert response.status_code in (200, 400), label
++        assert_clean_error(response, ("OR 1=1", "DROP", "<script", "<b>", "a" * 100))
++        if response.status_code == 400:
++            assert response.headers["content-type"] == "application/problem+json" and response.json()["code"] == "INVALID_PARAMETER"
++            validate("Problem", response.json())
++        else:
++            validate("SearchResponse", response.json())
++            echoed = response.json()["query_normalized"]
++            assert re.fullmatch(r"([a-z0-9]+( [a-z0-9]+)*)?", echoed) and len(echoed) <= 80, (label, echoed)           # no markup, quote, ; or control character survives
++
++
++def test_every_error_kind_is_a_problem_with_the_contract_code_set(client, validate, contract):
++    codes = set(contract["components"]["schemas"]["ProblemCode"]["enum"])
++    seen = set()
++    for url in (f"{P}ea:1", f"{P}ea:1/lineage", f"{P}p:abc", f"{P}ea:01/injuries", f"{P}search?q=a", f"{P}search?q=ab&limit=0", f"{P}search?q=ab&bogus=1", f"{P}search"):
++        response = client.get(url)
++        assert response.headers["content-type"] == "application/problem+json", url
++        body = response.json()
++        validate("Problem", body)
++        assert body["code"] in codes and body["status"] == response.status_code
++        seen.add(body["code"])
++    assert seen == {"PLAYER_NOT_FOUND", "INVALID_PLAYER_ID", "INVALID_PARAMETER"}
++
++
++def test_unexpected_failures_are_500_problems_for_every_route_without_leaks(client, monkeypatch, validate):
++    from api.services import player_summary
++
++    def boom(*args, **kwargs):
++        raise RuntimeError("secret internals /home/x/football_intel.duckdb select * from players Traceback")
++    urls = {"profile": f"{P}ea:{HAALAND}", "ea": f"{P}ea:{HAALAND}/ea-attributes", "lineage": f"{P}ea:{HAALAND}/lineage", "search": f"{P}search?q=haaland",
++            "market": f"{P}ea:{HAALAND}/market-value"}
++    # which routes must fail when a shared helper fails (exactly these; every other route is untouched and must keep answering 200)
++    # (call graph, read from the code: build_summary <- profile + search; build_summary -> build_identity + ea_ingame_value -> ea_provenance;
++    #  ea-attributes -> ea_ingame_value + ea_provenance; lineage -> build_identity; market-value uses none of them)
++    must_fail = {"build_summary": {"profile", "search"}, "build_identity": {"profile", "search", "lineage"},
++                 "ea_ingame_value": {"profile", "search", "ea"}, "ea_provenance": {"profile", "search", "ea"}}
++    assert all(client.get(u).status_code == 200 for u in urls.values())                          # control: nothing fails without the patch
++    for target, failing in must_fail.items():
++        monkeypatch.setattr(player_summary, target, boom)
++        for name, url in urls.items():
++            response = client.get(url)
++            assert response.status_code == (500 if name in failing else 200), (target, name, response.status_code)
++            if name in failing:
++                assert response.headers["content-type"] == "application/problem+json" and response.json()["code"] == "INTERNAL_ERROR"
++                validate("Problem", response.json())
++                assert_clean_error(response, ("secret", "football_intel"))
++        monkeypatch.undo()
++
++
++def test_no_internal_identifier_in_any_success_response(client, population, full_db):
++    import duckdb
++    con = duckdb.connect(str(full_db), read_only=True)
++    uids = [r[0] for r in con.execute("select player_uid from players").fetchall()]
++    con.close()
++    texts = [client.get(f"{P}ea:{i}{tail}").text for i in population[:60] for tail in PLAYER_ROUTES]
++    texts += [client.get(f"{P}search?q={q}&limit=50").text for q in ("an", "ma", "haaland", "vini", "ar", "jo")] + [client.get("/api/v1/health").text, client.get("/api/v1/data-freshness").text]
++    for text in texts:
++        assert "canonical_player_uid" not in text and "player_uid" not in text and "source_record_id" not in text and not UUID_RE.search(text)
++        assert not any(u in text or u.replace("-", "") in text for u in uids)
++        assert not re.search(r"/home/|/tmp/|/mnt/|\.duckdb|traceback", text, re.I)
++
++
++def test_headers_expose_nothing_beyond_the_content_type(client):
++    for url in ("/api/v1/health", f"{P}ea:{HAALAND}", f"{P}ea:{HAALAND}/lineage", f"{P}ea:1", f"{P}p:abc", "/nope"):
++        headers = {k.lower() for k in client.get(url).headers}
++        assert headers <= {"content-type", "content-length"}, (url, headers)                      # no server banner, cookie, CORS or debug header by default
++    assert client.post("/api/v1/health").headers["allow"] == "GET"
++
++
++def test_docs_and_openapi_are_off_by_default(client):
++    assert {p: client.get(p).status_code for p in ("/docs", "/redoc", "/openapi.json")} == {"/docs": 404, "/redoc": 404, "/openapi.json": 404}
++
++
++@pytest.mark.parametrize("path", ["/api/v1/health", "/api/v1/data-freshness", "/api/v1/players/search?q=ab", f"{P}ea:{HAALAND}", f"{P}ea:{HAALAND}/market-value",
++                                  f"{P}ea:{HAALAND}/injuries", f"{P}ea:{HAALAND}/ea-attributes", f"{P}ea:{HAALAND}/lineage", f"{P}ea:1", f"{P}p:abc"])
++def test_every_route_is_read_only_405_for_all_write_methods(client, path):
++    for call in (client.post, client.put, client.delete, client.patch):
++        response = call(path)
++        assert response.status_code == 405 and response.headers["allow"] == "GET"
++
++
++# ---------------------------------------------------------------------------------------------- 4. query budget (pinned maxima: an N+1 fails here)
++def test_query_budget_of_every_endpoint(client):
++    budget = [("/api/v1/health", 1), ("/api/v1/data-freshness", 6), (f"{P}search?q=haaland&limit=20", 3), (f"{P}search?q=an&entity_kind=CANONICAL&limit=50", 3),
++              (f"{P}search?q=an&limit=50", 3), (f"{P}ea:{HAALAND}", 4), (f"{P}ea:{SALAH}", 0), (f"{P}ea:{HAALAND}/market-value", 1), (f"{P}ea:{SALAH}/market-value", 0),
++              (f"{P}ea:{HAALAND}/injuries", 1), (f"{P}ea:{SALAH}/injuries", 0), (f"{P}ea:{HAALAND}/ea-attributes", 0), (f"{P}ea:{SALAH}/ea-attributes", 0),
++              (f"{P}ea:{HAALAND}/lineage", 1), (f"{P}ea:{SALAH}/lineage", 1), (f"{P}ea:1", 0), (f"{P}ea:1/lineage", 0), (f"{P}p:abc", 0), (f"{P}search?q=a", 0)]
++    for url, maximum in budget:
++        with count_queries(client) as c:
++            client.get(url)
++        assert c["n"] <= maximum, (url, c["n"], maximum)
++
++
++def test_search_cost_does_not_grow_with_the_number_of_items(client):
++    counts = []
++    for limit in (1, 5, 50):
++        with count_queries(client) as c:
++            assert client.get(f"{P}search?q=an&limit={limit}").status_code == 200
++        counts.append(c["n"])
++    assert max(counts) <= 3 and len(set(counts)) <= 2                                           # a batch, not one query per hit
++
++
++# ---------------------------------------------------------------------------------------------- 5. read-only and determinism, for the whole API
++def sweep(client, ids):
++    out = {}
++    for ea_id in ids:
++        for route, response in get_all(client, ea_id).items():
++            out[(ea_id, route)] = mask(response.json())
++    for q in ("haaland", "an", "vinicius"):
++        out[("search", q)] = mask(client.get(f"{P}search?q={q}&limit=20").json())
++    out["health"] = mask(client.get("/api/v1/health").json())
++    out["freshness"] = mask(client.get("/api/v1/data-freshness").json())
++    return out
++
++
++def test_serving_the_whole_api_never_modifies_the_database_and_is_deterministic(full_db, tmp_path):
++    path = tmp_path / "ro.duckdb"
++    shutil.copy(full_db, path)
++    digest, mtime = hashlib.sha256(path.read_bytes()).hexdigest(), os.stat(path).st_mtime_ns
++    ids = [*SAMPLE, 100000, 190000, 230000, 250000]
++    with TestClient(create_app(ApiConfig(db_path=path)), raise_server_exceptions=False) as c:
++        ids = [i for i in ids if c.get(f"{P}ea:{i}").status_code == 200]
++        first, second = sweep(c, ids), sweep(c, ids)
++        for url in (f"{P}ea:1", f"{P}p:abc", f"{P}search?q=a", "/nope"):
++            c.get(url)
++        for call in (c.post, c.put, c.delete, c.patch):
++            call(f"{P}ea:{HAALAND}")
++    assert first == second and len(first) >= 5 * len(SAMPLE)
++    assert hashlib.sha256(path.read_bytes()).hexdigest() == digest and os.stat(path).st_mtime_ns == mtime
++    assert not [f for f in os.listdir(tmp_path) if f != "ro.duckdb"]                       # no WAL / temp file was created next to the database
